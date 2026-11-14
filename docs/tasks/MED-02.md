@@ -2,10 +2,10 @@
 
 lane: app-gpui
 status: todo
-deps: [MED-01, макет «Медиа беседы» (дизайн-сессия)]
+deps: [MED-01]
 class: A
 files: [app-gpui/src/thread_media.rs, app-gpui/src/reading.rs, app-gpui/src/commands.rs, app-gpui/src/screens.rs, app-gpui/i18n/*/*.ftl]
-read: [docs/decisions/2026-11-13-thread-media.md, docs/tasks/MED-01.md]
+read: [docs/decisions/2026-11-13-thread-media.md, docs/tasks/MED-01.md, docs/DESIGN.md]
 checks: [nextest, screens:thread-media-files,thread-media-media,thread-media-links,thread-media-contacts,thread-media-meetings,thread-media-partial]
 manual: yes                 # docs/manual-tests/MED-02.md
 
@@ -50,5 +50,11 @@ Telegram. Термины — как в Outlook: «беседа», не «цеп�
 ## Сделано
 —
 
+## Макет
+Утверждён 2026-11-14: `docs/DESIGN.md` «Медиа беседы»; холст — страница «✓ Медиа беседы» (`MedEntry`, `MedFiles`,
+`MedMac`, виды — обёртки `MedFilesGrid`, `MedFilesTable`, `MedLinksTable`, `MedContactsGrid`, `MedStates`).
+Решено дизайном: режим вместо ленты (вкладки «Беседа | Медиа беседы»), пустая вкладка видна с 0, три вида на всех
+вкладках, столбец «Канал».
+
 ## Не сделано
-- Всё: ждёт макет.
+- Всё: интерфейс по макету.

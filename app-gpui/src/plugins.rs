@@ -23,6 +23,9 @@ pub(crate) fn registry() -> &'static Registry {
         // (`account_telegram`), без учётки сети нет.
         #[cfg(feature = "telegram")]
         let r = r.with_channel(postman_backend_telegram::TelegramChannel::new());
+        // Matrix (CH-05) — признаком `matrix`: в dev-сборке всегда, в release — с `matrix-release` (`account_matrix`).
+        #[cfg(all(feature = "matrix", any(debug_assertions, feature = "matrix-release")))]
+        let r = r.with_channel(postman_backend_matrix::MatrixChannel::new());
         r
     })
 }

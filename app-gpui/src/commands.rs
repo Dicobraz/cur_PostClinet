@@ -285,7 +285,7 @@ mod tests {
         for entry in std::fs::read_dir(&src).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "rs") && path.file_name().is_some_and(|n| n != "commands.rs") {
-                sources += &std::fs::read_to_string(&path).unwrap();
+                sources += std::fs::read_to_string(&path).unwrap().as_str();
             }
         }
         let (doc, done) = super::parity::document(&sources);

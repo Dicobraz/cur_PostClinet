@@ -104,6 +104,8 @@ impl Mailer {
         };
         let secrets: Arc<dyn Secrets> = Arc::new(OsSecrets);
         let prefs = crate::prefs::get(cx);
+        // «Шифрованные беседы» (ADR 0012, решение п. 1): выбор — до потоков учёток; база записана под другой — в фоне.
+        self.apply_encrypted(crate::account_matrix::encrypted(&prefs), index.clone(), cx);
         for store in stores {
             // Канал выключен настройкой или политикой (ADR 0012 п. 11): поток не запускается, данные — в базе.
             if !crate::account_telegram::channel_on(&store.channel().0, &prefs) {
@@ -251,6 +253,10 @@ impl Mailer {
                 self.channels.names.retain(|(a, _)| *a != account);
             }
             Update::Connected { me, .. } => self.channels.set_name(&account, me.name),
+            Update::Flow(reply) => {
+                cx.set_global(crate::account_matrix::FlowReply(Some((account, reply))));
+                return;
+            }
             Update::Changed { conversations, gone } => {
                 tracing::debug!(channel = %account.channel, changed = conversations.len(), gone = gone.len(), "channel: conversations changed");
                 return;
@@ -298,35 +304,89 @@ impl Mailer {
                     tracing::warn!(channel = %account.channel, "channel: sign-out, account not running");
                 }
             }
-            PanelEvent::Signed { account, name, secret } => {
-                let Some(plugin) = crate::plugins::registry().channel(TELEGRAM).cloned() else { return };
-                let id = ChannelId::new(TELEGRAM);
+            PanelEvent::Signed { account, name, secret } => self.add_account(TELEGRAM, account, name, secret, cx),
+        }
+    }
+
+    /// Вход удался: секрет — в хранилище ОС, строка учётки — в базу профиля (в фоне); затем поток учётки.
+    fn add_account(&mut self, channel_id: &'static str, account: AccountId, name: String, secret: Secret, cx: &mut Context<Self>) {
+        let Some(plugin) = crate::plugins::registry().channel(channel_id).cloned() else { return };
+        let id = ChannelId::new(channel_id);
+        let index = self.live.index.clone();
+        let cache = self.cache.clone();
+        self.channels.set_name(&ChanAccount::new(channel_id, account.0.clone()), name.clone());
+        let task = cx.background_spawn({
+            let (account, name) = (account.clone(), name.clone());
+            async move {
+                OsSecrets.put(&id, &account, &secret)?;
+                channel::ChannelStore::open(cache, &id, &account, &name).map(|_| ())
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let stored = task.await;
+            let _ = this.update(cx, |m, cx| match stored {
+                Ok(()) => {
+                    tracing::info!(channel = channel_id, "channel: account added");
+                    let start = Start { cache: m.cache.clone(), secrets: Arc::new(OsSecrets), account, name, render: Some(render()), index };
+                    m.spawn_channel(plugin, start, cx);
+                    m.publish_channels(cx);
+                }
+                Err(e) => tracing::warn!(channel = channel_id, "channel: account not stored: {e}"),
+            });
+        })
+        .detach();
+    }
+
+    /// «Каналы бесед» → Matrix (CH-05): включатель, вход, «Выйти», проверка устройства и ключи, «Шифрованные беседы».
+    pub(crate) fn on_matrix(&mut self, ev: crate::account_matrix::PanelEvent, cx: &mut Context<Self>) {
+        use crate::account_matrix::{MATRIX, PanelEvent};
+        match ev {
+            PanelEvent::Toggled(on) => {
+                crate::prefs::update(cx, |p| p.channels.matrix = on);
+                if on {
+                    let index = self.live.index.clone();
+                    self.start_channels(index, cx);
+                } else {
+                    self.channels.lines.retain(|(a, _)| a.channel.0 != MATRIX);
+                    self.channels.states.retain(|(a, _)| a.channel.0 != MATRIX);
+                    tracing::info!(channel = MATRIX, "channel: switched off");
+                }
+                self.publish_channels(cx);
+            }
+            PanelEvent::SignOut(account) => {
+                if !self.channels.send(&account, Request::SignOut) {
+                    tracing::warn!(channel = %account.channel, "channel: sign-out, account not running");
+                }
+            }
+            PanelEvent::Signed { account, name, secret } => self.add_account(MATRIX, account, name, secret, cx),
+            PanelEvent::Flow { account, kind } => {
+                if !self.channels.send(&account, Request::Flow { kind }) {
+                    cx.set_global(crate::account_matrix::FlowReply(Some((account, Err(ChannelError::Network("offline".into()))))));
+                }
+            }
+            PanelEvent::Answer { account, answer } => {
+                let _ = self.channels.send(&account, Request::Answer(answer));
+            }
+            PanelEvent::Encrypted(mode) => {
+                crate::prefs::update(cx, |p| p.channels.encrypted = mode);
                 let index = self.live.index.clone();
-                let cache = self.cache.clone();
-                self.channels.set_name(&ChanAccount::new(TELEGRAM, account.0.clone()), name.clone());
-                // Секрет — в хранилище ОС, строка учётки — в базу профиля: в фоне; затем поток учётки.
-                let task = cx.background_spawn({
-                    let (account, name) = (account.clone(), name.clone());
-                    async move {
-                        OsSecrets.put(&id, &account, &secret)?;
-                        channel::ChannelStore::open(cache, &id, &account, &name).map(|_| ())
-                    }
-                });
-                cx.spawn(async move |this, cx| {
-                    let stored = task.await;
-                    let _ = this.update(cx, |m, cx| match stored {
-                        Ok(()) => {
-                            tracing::info!(channel = TELEGRAM, "channel: account added");
-                            let start = Start { cache: m.cache.clone(), secrets: Arc::new(OsSecrets), account, name, render: Some(render()), index };
-                            m.spawn_channel(plugin, start, cx);
-                            m.publish_channels(cx);
-                        }
-                        Err(e) => tracing::warn!(channel = TELEGRAM, "channel: account not stored: {e}"),
-                    });
-                })
-                .detach();
+                self.apply_encrypted(mode, index, cx);
             }
         }
+    }
+
+    /// Выбор «Шифрованные беседы» — процессу сразу, база и индекс — в фоне (`channel::e2e::apply`).
+    fn apply_encrypted(&mut self, mode: channel::e2e::E2eStore, index: Index, cx: &mut Context<Self>) {
+        channel::e2e::set_mode(mode);
+        let cache = self.cache.clone();
+        cx.background_spawn(async move {
+            match channel::e2e::apply(&cache, index.as_deref(), mode) {
+                Ok(s) if s.rewritten > 0 => tracing::info!(rewritten = s.rewritten, "channel: encrypted conversations rewritten"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("channel: encrypted conversations not rewritten: {e}"),
+            }
+        })
+        .detach();
     }
 }
 

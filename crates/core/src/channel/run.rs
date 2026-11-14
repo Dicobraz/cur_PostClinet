@@ -66,6 +66,11 @@ pub enum Request {
     Reconnect,
     /// «Выйти»: сессия на сервере, строки учётки, её `local` и секрет.
     SignOut,
+    /// Поток вопросов после входа (`ChannelSession::flow`: проверка устройства, ключ резервной копии) — с первого
+    /// вопроса; ответы — [`Request::Answer`], вопросы — [`Update::Flow`]. Новый поток заменяет прежний.
+    Flow { kind: super::FlowKind },
+    /// Ответ на вопрос потока ([`Request::Flow`]).
+    Answer(super::Answer),
 }
 
 /// Ответ потока интерфейсу.
@@ -136,6 +141,8 @@ pub enum Update {
     },
     /// Вышли: данных учётки в базе нет.
     SignedOut,
+    /// Вопрос потока ([`Request::Flow`]) или отказ шага; `Prompt::Finished` — поток кончился.
+    Flow(Result<super::Prompt, ChannelError>),
 }
 
 /// HTML → IR в воркере-песочнице (`postman_worker::Request::Html`); ошибка — текст для журнала.
@@ -248,6 +255,35 @@ enum Finished {
         ticket: u64,
         result: Result<Uploaded, ChannelError>,
     },
+    Flow(Result<super::Prompt, ChannelError>),
+}
+
+/// Поток вопросов сессии — задачей: шаг за шагом по ответам `answers`; кончился или ответов больше нет — конец.
+fn start_flow(session: &Rc<dyn ChannelSession>, done: &UnboundedSender<Finished>, kind: super::FlowKind) -> UnboundedSender<super::Answer> {
+    let (tx, mut answers) = unbounded_channel::<super::Answer>();
+    let (s, done) = (Rc::clone(session), done.clone());
+    tokio::task::spawn_local(async move {
+        let mut flow = match s.flow(kind).await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = done.send(Finished::Flow(Err(e)));
+                return;
+            }
+        };
+        let mut answer = None;
+        loop {
+            let r = flow.step(answer.take()).await;
+            let end = matches!(r, Ok(super::Prompt::Finished | super::Prompt::Done { .. }));
+            if done.send(Finished::Flow(r)).is_err() || end {
+                return;
+            }
+            match answers.recv().await {
+                Some(a) => answer = Some(a),
+                None => return,
+            }
+        }
+    });
+    tx
 }
 
 /// Пауза перед повтором после ошибки; `None` — не повторять (вход истёк, нет прав, не умеет).
@@ -352,7 +388,8 @@ fn refuse(r: Request, error: ChannelError, notify: &dyn Fn(Update)) {
         Request::Download { conversation, message, source, .. } => notify(Update::Downloaded { conversation, message, source, result: Err(error) }),
         Request::Send { outgoing, .. } => notify(Update::SendFailed { client_id: outgoing.client_id, error }),
         Request::Unsend { client_id } => notify(Update::Unsent { client_id, done: false }),
-        Request::History { .. } | Request::Reconnect | Request::SignOut => {}
+        Request::Flow { .. } => notify(Update::Flow(Err(error))),
+        Request::History { .. } | Request::Reconnect | Request::SignOut | Request::Answer(_) => {}
     }
 }
 
@@ -547,6 +584,8 @@ async fn connected(store: &ChannelStore, session: Rc<dyn ChannelSession>, incomi
     let mut closing: Option<Instant> = None;
     // Выход отправил то, что в окне, — один раз: «позже» остаётся в очереди и выход больше не ждёт.
     let mut left = outbox::leaving();
+    // Поток вопросов после входа (проверка устройства, ключ резервной копии): куда слать ответы.
+    let mut flow: Option<UnboundedSender<super::Answer>> = None;
     catch_up(&session, store, &done_tx);
     loop {
         if let Some(until) = closing
@@ -586,6 +625,12 @@ async fn connected(store: &ChannelStore, session: Rc<dyn ChannelSession>, incomi
                     }
                     sign_out(store, ctx);
                     return Ended::Stopped;
+                }
+                Some(Request::Flow { kind }) => flow = Some(start_flow(&session, &done_tx, kind)),
+                Some(Request::Answer(a)) => {
+                    if let Some(tx) = &flow {
+                        let _ = tx.send(a);
+                    }
                 }
                 Some(r) => request(r, store, &session, &done_tx, &*ctx.notify),
             },
@@ -720,7 +765,8 @@ fn request(r: Request, store: &ChannelStore, session: &Rc<dyn ChannelSession>, d
             notify(Update::SendFailed { client_id: outgoing.client_id, error: ChannelError::Protocol("send outside the queue".into()) })
         }
         Request::Unsend { client_id } => notify(Update::Unsent { client_id, done: false }),
-        Request::Reconnect | Request::SignOut => {}
+        // Потоки вопросов держит цикл подключения (`connected`).
+        Request::Reconnect | Request::SignOut | Request::Flow { .. } | Request::Answer(_) => {}
     }
 }
 
@@ -796,6 +842,13 @@ fn finished(fin: Finished, store: &ChannelStore, ctx: &RunCtx, pending: &mut Pen
         Finished::Download { conversation, message, source, mime, sink, result } => {
             let result = result.and_then(|()| store.finish_download(sink, &conversation, &message, &source, &mime));
             notify(Update::Downloaded { conversation, message, source, result });
+            None
+        }
+        Finished::Flow(r) => {
+            if let Err(e) = &r {
+                tracing::info!("channel flow step refused: {e}");
+            }
+            notify(Update::Flow(r));
             None
         }
         Finished::Upload { ticket, result } => {

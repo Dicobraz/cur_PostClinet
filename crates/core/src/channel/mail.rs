@@ -381,7 +381,9 @@ impl MailSource {
                 }
             }
             // Отправка почты — письмом (окно «Отменить» и «позже» держит путь почты), не очередью каналов.
-            Request::Upload { .. } | Request::SignOut | Request::Send { .. } | Request::Unsend { .. } => return Err(ChannelError::Unsupported),
+            Request::Upload { .. } | Request::SignOut | Request::Send { .. } | Request::Unsend { .. } | Request::Flow { .. } | Request::Answer(_) => {
+                return Err(ChannelError::Unsupported);
+            }
         }
         Ok(plan)
     }

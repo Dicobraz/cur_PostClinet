@@ -187,6 +187,8 @@ pub(crate) enum SettingsEvent {
     RecheckSandbox,
     /// Каналы бесед (CH-03): вход, «Выйти», включатель Telegram.
     Telegram(crate::account_telegram::PanelEvent),
+    /// Matrix (CH-05): вход, «Выйти», проверка устройства, ключи, «Шифрованные беседы».
+    Matrix(crate::account_matrix::PanelEvent),
 }
 
 pub(crate) struct SettingsView {
@@ -251,6 +253,8 @@ pub(crate) struct SettingsView {
     pub(crate) domains: crate::remote_images::DomainsState,
     /// «Аккаунты → Каналы бесед» (CH-03): Telegram — включатель, учётки, вход на месте.
     pub(crate) channels: Entity<crate::account_telegram::Panel>,
+    /// «Аккаунты → Каналы бесед» (CH-05): Matrix.
+    pub(crate) matrix: Entity<crate::account_matrix::Panel>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -300,6 +304,10 @@ impl SettingsView {
         subscriptions.push(cx.subscribe(&channels, |_, _, ev: &crate::account_telegram::PanelEvent, cx| {
             cx.emit(SettingsEvent::Telegram(ev.clone()));
         }));
+        let matrix = cx.new(crate::account_matrix::Panel::new);
+        subscriptions.push(cx.subscribe(&matrix, |_, _, ev: &crate::account_matrix::PanelEvent, cx| {
+            cx.emit(SettingsEvent::Matrix(ev.clone()));
+        }));
         let mut v = Self {
             section,
             search,
@@ -340,6 +348,7 @@ impl SettingsView {
             files,
             domains,
             channels,
+            matrix,
             _subscriptions: subscriptions,
         };
         v.read_os(cx);

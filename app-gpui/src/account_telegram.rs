@@ -43,7 +43,11 @@ pub(crate) fn enabled(p: &Prefs) -> bool {
 
 /// Канал включён (для потоков учёток): чужие каналы (демо) — всегда.
 pub(crate) fn channel_on(id: &str, p: &Prefs) -> bool {
-    id != TELEGRAM || enabled(p)
+    match id {
+        TELEGRAM => enabled(p),
+        crate::account_matrix::MATRIX => crate::account_matrix::enabled(p),
+        _ => true,
+    }
 }
 
 /// Ключ приложения есть в сборке (без него вход отвечает «нет ключа приложения»).
@@ -83,7 +87,7 @@ pub(crate) enum PanelEvent {
 }
 
 /// Ответ потока входа.
-type Reply = Result<Prompt, ChannelError>;
+pub(crate) type Reply = Result<Prompt, ChannelError>;
 
 /// Вход на месте.
 struct Card {
@@ -375,8 +379,9 @@ pub(crate) fn error_text(e: &ChannelError) -> String {
     }
 }
 
-/// Поток входа: свой рантайм tokio и `LocalSet` (шаги входа — не `Send`); ответы — в интерфейс.
-fn flow_thread(
+/// Поток входа: свой рантайм tokio и `LocalSet` (шаги входа — не `Send`); ответы — в интерфейс. Общий для каналов
+/// (Telegram, Matrix — `account_matrix`).
+pub(crate) fn flow_thread(
     plugin: std::sync::Arc<dyn postman_core::channel::ChannelPlugin>,
 ) -> (postman_core::sync::UnboundedSender<Option<Answer>>, futures::channel::mpsc::UnboundedReceiver<Reply>) {
     let (answers, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<Answer>>();

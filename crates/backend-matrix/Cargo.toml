@@ -1,0 +1,40 @@
+[package]
+name = "postman-backend-matrix"
+description = "Канал Matrix (ADR 0012, CH-05): matrix-sdk, договор postman_core::channel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+# Подставной сервер Matrix для тестов договора без сети (`fake`): ответы Client-Server API на loopback.
+testkit = []
+
+[dependencies]
+postman-core.workspace = true
+postman-ir.workspace = true
+# Клиент Matrix (ADR 0012 п. 12, Apache-2.0): сквозное шифрование (vodozemac), сеть — тот же reqwest и rustls, что у
+# почтовых путей. Хранилища SDK — свои, поверх `PluginStore` ядра (решение «всё в базе»): без SQLite и файлов.
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "rustls-aws-lc-rs"] }
+# Шифрование своих данных канала ключом из хранилища секретов ОС (та же копия, что у matrix-sdk).
+matrix-sdk-base = { version = "0.19.1", default-features = false, features = ["e2e-encryption"] }
+matrix-sdk-store-encryption = "0.19.1"
+async-trait = "0.1"
+futures-util = "0.3"
+base64 = "0.22"
+getrandom = "0.4"
+zeroize = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing = "0.1"
+url.workspace = true
+
+[dev-dependencies]
+http = "1"
+postman-backend-matrix = { path = ".", features = ["testkit"] }
+postman-cache.workspace = true
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+
+[lints]
+workspace = true

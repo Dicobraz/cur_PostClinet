@@ -83,11 +83,17 @@ pub struct Prefs {
 }
 
 /// Каналы бесед, включённые пользователем (ADR 0012 п. 11): до стабилизации — выключены по умолчанию (решение
-/// владельца 2026-11-14). Политика организации (`AllowChannelTelegram`) сильнее — запрещённый канал не включить.
+/// владельца 2026-11-14). Политика организации (`AllowChannelTelegram`, `AllowChannelMatrix`) сильнее — запрещённый
+/// канал не включить.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Channels {
     pub telegram: bool,
+    /// Канал Matrix (CH-05). Добавочно — нет в файле, выключен.
+    pub matrix: bool,
+    /// «Каналы → Шифрованные беседы» (ADR 0012, решение п. 1): где держать расшифрованный текст; политика
+    /// `ChannelE2EStorePlaintext` сильнее.
+    pub encrypted: crate::channel::e2e::E2eStore,
 }
 
 /// «Ответы и пересылка» (#655), как «Почта → Ответы и пересылка» Outlook. Пересылка цитирует всегда.
@@ -1605,10 +1611,12 @@ mod tests {
     #[test]
     fn channels_off_by_default() {
         let old: Prefs = serde_json::from_str(r#"{"version":1}"#).unwrap();
-        assert!(!old.channels.telegram);
-        let on = Prefs { channels: Channels { telegram: true }, ..Prefs::default() };
+        assert!(!old.channels.telegram && !old.channels.matrix);
+        assert_eq!(old.channels.encrypted, crate::channel::e2e::E2eStore::Search, "шифрованные беседы — «хранить и искать»");
+        let on = Prefs { channels: Channels { telegram: true, matrix: true, encrypted: crate::channel::e2e::E2eStore::Memory }, ..Prefs::default() };
         let back: Prefs = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
-        assert!(back.channels.telegram);
+        assert!(back.channels.telegram && back.channels.matrix);
+        assert_eq!(back.channels.encrypted, crate::channel::e2e::E2eStore::Memory);
     }
 
     #[test]

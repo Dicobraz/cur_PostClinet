@@ -3,7 +3,9 @@
 //! в Диспетчере учётных данных или не хранить; проверка отзыва — всегда. Политика — `Software\Policies\Pets\Postman`
 //! (HKLM, затем HKCU) или профиль конфигурации macOS; ключи и типы — одни для всех ОС (POL-01,
 //! `docs/tasks/POL-01.md`): `ExternalImages` = `never` | `ask`, `MinTls` = `1.2` | `1.3` (строка; macOS — и число),
-//! `StorePasswords`, `AllowUpdate`, `AllowChannelTelegram` = `0` | `1` (строка, `REG_DWORD`, логическое) — закрепляет значение, в настройках
+//! `StorePasswords`, `AllowUpdate`, `AllowChannelTelegram`, `AllowChannelMatrix` = `0` | `1` (строка, `REG_DWORD`,
+//! логическое), `ChannelE2EStorePlaintext` = `2` | `1` | `0` (шифрованные беседы: хранить и искать / хранить, не
+//! искать / только в памяти; число или строка) — закрепляет значение, в настройках
 //! оно недоступно. Неверный тип или значение — WARN в журнал, не закреплено. Linux (LIN-03) — файл
 //! `/etc/postman/policies.json` (JSON-объект, те же имена и типы; `sys::shell::POLICY_FILE`); там же
 //! `SandboxNamespaces` = `optional` | `required` ([`sandbox_namespaces`]).
@@ -22,6 +24,10 @@ pub(crate) struct Policy {
     pub(crate) store_password: Option<bool>,
     /// `AllowChannelTelegram` (ADR 0012 п. 11): `0` — канала нет, `1` — включён без выбора.
     pub(crate) telegram: Option<bool>,
+    /// `AllowChannelMatrix` (ADR 0012 п. 11, CH-05): как `AllowChannelTelegram`.
+    pub(crate) matrix: Option<bool>,
+    /// `ChannelE2EStorePlaintext` (ADR 0012, решение п. 1): выбор «Шифрованные беседы» за пользователя.
+    pub(crate) encrypted: Option<postman_core::channel::e2e::E2eStore>,
 }
 
 impl Policy {
@@ -32,7 +38,24 @@ impl Policy {
             tls13: policy_tls13("MinTls", read("MinTls")),
             store_password: policy_flag("StorePasswords", read("StorePasswords")),
             telegram: policy_flag("AllowChannelTelegram", read("AllowChannelTelegram")),
+            matrix: policy_flag("AllowChannelMatrix", read("AllowChannelMatrix")),
+            encrypted: policy_e2e("ChannelE2EStorePlaintext", read("ChannelE2EStorePlaintext")),
         }
+    }
+}
+
+/// Шифрованные беседы: `2` | `1` | `0` числом (`REG_DWORD`, `<integer>`) или строкой.
+pub(crate) fn policy_e2e(name: &str, value: Option<PolicyValue>) -> Option<postman_core::channel::e2e::E2eStore> {
+    use postman_core::channel::e2e::E2eStore;
+    let value = value?;
+    let code = match &value {
+        PolicyValue::Int(n) => Some(*n),
+        PolicyValue::Text(t) => t.trim().parse().ok(),
+        _ => None,
+    };
+    match code.and_then(E2eStore::from_policy) {
+        Some(m) => Some(m),
+        None => rejected(name, &value),
     }
 }
 
@@ -178,9 +201,18 @@ mod tests {
     #[test]
     fn policy_pins_and_choice_follows() {
         let pol = values(text("Ask"), text("1.3"), text("0"));
-        assert_eq!(pol, Policy { images: Some(Images::Ask), tls13: Some(true), store_password: Some(false), telegram: None });
+        assert_eq!(pol, Policy { images: Some(Images::Ask), tls13: Some(true), store_password: Some(false), ..Policy::default() });
         let tg = Policy::read_with(|n| (n == "AllowChannelTelegram").then_some(PolicyValue::Int(0)));
         assert_eq!(tg.telegram, Some(false), "AllowChannelTelegram = 0 — канала нет");
+        let mx = Policy::read_with(|n| (n == "AllowChannelMatrix").then_some(PolicyValue::Int(1)));
+        assert_eq!((mx.matrix, mx.telegram), (Some(true), None));
+        use postman_core::channel::e2e::E2eStore;
+        let e2e = |v: PolicyValue| Policy::read_with(move |n| (n == "ChannelE2EStorePlaintext").then(|| v.clone())).encrypted;
+        assert_eq!(e2e(PolicyValue::Int(0)), Some(E2eStore::Memory));
+        assert_eq!(e2e(PolicyValue::Text(" 1 ".into())), Some(E2eStore::Store));
+        assert_eq!(e2e(PolicyValue::Int(2)), Some(E2eStore::Search));
+        assert_eq!(e2e(PolicyValue::Int(3)), None, "чужое — не закреплено");
+        assert_eq!(e2e(PolicyValue::Bool(true)), None);
         assert_eq!(values(text("always"), text("1.0"), text("maybe")), Policy::default(), "слабее — не бывает");
         assert_eq!(values(None, None, None), Policy::default());
         let mut p = Prefs::default();

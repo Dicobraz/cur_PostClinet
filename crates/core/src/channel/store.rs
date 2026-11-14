@@ -253,7 +253,11 @@ impl Applied {
 pub(super) fn entry(doc: MsgDoc) -> Result<Entry> {
     let loaded = doc.loaded.into_iter().map(|(s, h)| (AttachmentSource(s), h)).collect();
     Ok(match dec_msg(&doc.value)? {
-        MsgEnvelope::V2(message) => Entry::Message { key: doc.key, message, loaded },
+        MsgEnvelope::V2(mut message) => {
+            // Шифрованная беседа в режиме «только в памяти»: текст — из памяти процесса (ADR 0012, решение п. 1).
+            super::e2e::recall(doc.key, &mut message);
+            Entry::Message { key: doc.key, message, loaded }
+        }
         MsgEnvelope::Retired => return Err(ChannelError::Storage("retired message envelope".into())),
         MsgEnvelope::Deleted { author, sent } => Entry::Deleted { key: doc.key, id: super::MessageId(doc.remote), author, sent },
     })
@@ -495,16 +499,27 @@ impl ChannelStore {
                 }
                 ChannelEvent::Messages { conversation, messages, live } => {
                     let k = conv_of(&conversation, &mut out)?;
+                    // Шифрованная беседа (ADR 0012, решение п. 1): «не искать» — без документа поиска, «только в
+                    // памяти» — в базе строка без текста, текст — в памяти процесса.
+                    let mode = super::e2e::mode();
+                    let encrypted = mode != super::e2e::E2eStore::Search && read_conv(k)?.is_some_and(|(c, _)| c.encrypted);
                     for m in messages {
-                        let value = enc(&MsgEnvelope::V2(m.clone()))?;
-                        let srcs = sources(&m);
+                        let memory = encrypted && !mode.stored();
+                        let kept = if memory { super::e2e::strip(&m) } else { m.clone() };
+                        let value = enc(&MsgEnvelope::V2(kept.clone()))?;
+                        let srcs = sources(&kept);
                         let put = MsgPut { remote: &m.id.0, sent: m.sent, edited: m.edited, value: &value, sources: &srcs };
                         let (mk, stored) = b.put_msg(k, &put)?;
+                        if memory {
+                            super::e2e::keep(mk, &m);
+                        }
                         if stored == Stored::Same {
                             continue;
                         }
                         out.written += 1;
-                        if !out.indexed.contains(&mk) {
+                        if encrypted {
+                            out.unindexed.push(mk);
+                        } else if !out.indexed.contains(&mk) {
                             out.indexed.push(mk);
                         }
                         out.change(&conversation);
@@ -525,6 +540,7 @@ impl ChannelStore {
                         let sent = doc.sent;
                         let old = entry(doc).ok();
                         b.remove_msg(mk)?;
+                        super::e2e::forget(mk);
                         out.indexed.retain(|k| *k != mk);
                         out.unindexed.push(mk);
                         if for_all {
@@ -733,6 +749,48 @@ impl ChannelStore {
         self.cache.conv_unlink_prefix(&prefix)?;
         self.cache.person_unlink_account(&self.channel.0, &self.account.0)?;
         Ok(())
+    }
+
+    /// Шифрованные беседы учётки — под выбор `to` (ADR 0012, решение п. 1; `e2e::switch`): «только в памяти» —
+    /// текст уходит из базы в память процесса (строка переписывается без текста; история правок и загруженные части
+    /// уходят вместе со старой строкой); «хранить» — текст из памяти ложится в базу. Документы поиска — по итогу.
+    pub fn e2e_rewrite(&self, to: super::e2e::E2eStore) -> Result<super::e2e::Switched> {
+        use super::e2e;
+        let mut out = e2e::Switched::default();
+        let convs = Self::conversations(&self.cache, 0, usize::MAX)?;
+        let mine = convs.iter().filter(|c| c.conversation.encrypted && c.address.chan() == self.chan());
+        for c in mine {
+            let docs = self.cache.chan_timeline(c.key, None, usize::MAX)?;
+            let b = self.cache.chan_batch()?;
+            for doc in docs {
+                let (key, remote, sent, edited) = (doc.key, doc.remote.clone(), doc.sent, doc.edited);
+                let Ok(Entry::Message { message, .. }) = entry(doc) else { continue };
+                if to.stored() {
+                    // Текст был только в памяти — в базу.
+                    if let Some(full) = e2e::take(key) {
+                        let mut m = message.clone();
+                        m.body = full.body;
+                        m.attachments = full.attachments;
+                        m.quotes = full.quotes;
+                        m.forwarded = full.forwarded;
+                        b.set_msg_value(key, &enc(&MsgEnvelope::V2(m))?)?;
+                        out.rewritten += 1;
+                    }
+                    if to.indexed() { out.reindex.push(key) } else { out.unindex.push(key) }
+                } else {
+                    e2e::forget(key);
+                    let stripped = e2e::strip(&message);
+                    b.remove_msg(key)?;
+                    let value = enc(&MsgEnvelope::V2(stripped))?;
+                    let (nk, _) = b.put_msg(c.key, &MsgPut { remote: &remote, sent, edited, value: &value, sources: &[] })?;
+                    e2e::keep(nk, &message);
+                    out.unindex.push(key);
+                    out.rewritten += 1;
+                }
+            }
+            b.commit()?;
+        }
+        Ok(out)
     }
 }
 

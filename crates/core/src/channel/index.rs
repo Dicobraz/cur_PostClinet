@@ -104,6 +104,10 @@ struct Fields {
 fn fields(memo: &mut Memo, key: MsgKey, conv: ConvKey, m: &Message) -> Result<Option<Fields>> {
     let chan = memo.store.chan();
     let Some(c) = memo.conv(conv)? else { return Ok(None) };
+    // Шифрованная беседа — в поиске только при выборе «Хранить и искать» (ADR 0012, решение п. 1).
+    if c.conversation.encrypted && !super::e2e::mode().indexed() {
+        return Ok(None);
+    }
     let (title, address) = (c.conversation.title.clone(), c.address.to_string());
     let mut authors = vec![author_key(&chan, &m.author)];
     let mut people = m.author.0.clone();
@@ -182,6 +186,33 @@ pub fn applied(index: &SearchIndex, store: &ChannelStore, a: &super::Applied) {
     if let Err(e) = index.commit() {
         tracing::warn!("channel search: index not committed: {e}");
     }
+}
+
+/// Смена выбора для шифрованных бесед (`e2e::switch`): документы — убрать или собрать заново из базы.
+pub fn e2e_switched(index: &SearchIndex, cache: &Cache, s: &super::e2e::Switched) -> Result<()> {
+    if !s.unindex.is_empty() {
+        let ids: Vec<String> = s.unindex.iter().map(|k| doc_id(*k)).collect();
+        index.delete(&ids).map_err(|e| ChannelError::Storage(e.to_string()))?;
+    }
+    if !s.reindex.is_empty() {
+        let stores = ChannelStore::all(cache)?;
+        let mut memos: Vec<Memo> = stores.iter().map(Memo::new).collect();
+        let mut docs = Vec::new();
+        for k in &s.reindex {
+            let Some(doc) = cache.chan_msg(*k)? else { continue };
+            let Some(conv) = cache.chan_conv(doc.conv)? else { continue };
+            let Some(memo) = memos.iter_mut().find(|m| m.store.key() == conv.account) else { continue };
+            let (key, conv) = (doc.key, doc.conv);
+            if let Ok(Entry::Message { message, .. }) = super::store::entry(doc)
+                && let Some(f) = fields(memo, key, conv, &message)?
+            {
+                docs.push(f);
+            }
+        }
+        upsert(index, &docs);
+    }
+    index.commit().map_err(|e| ChannelError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 /// «Выйти»: документы всех бесед учётки — из индекса.

@@ -24,6 +24,7 @@
 //! Почта — канал `mail` адаптером ([`mail`], ADR 0012 п. 7) и через [`ChannelSession`] не идёт.
 
 pub mod conformance;
+pub mod e2e;
 pub mod export;
 pub mod forward;
 pub mod index;

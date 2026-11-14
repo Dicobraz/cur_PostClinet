@@ -3902,7 +3902,7 @@ pub(crate) fn initials(name: &str) -> String {
     match words.as_slice() {
         [] => String::new(),
         [one] => first(one),
-        [a, b, ..] => first(a) + &first(b),
+        [a, b, ..] => first(a) + first(b).as_str(),
     }
 }
 

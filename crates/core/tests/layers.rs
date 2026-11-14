@@ -40,6 +40,8 @@ const LAYERS: &[(&str, u8)] = &[
     ("postman-backend-ldap", L2B),
     // Канал Telegram (ADR 0012 п. 12): плагин канала бесед, MTProto — grammers.
     ("postman-backend-telegram", L2B),
+    // Канал Matrix (ADR 0012 п. 12, CH-05): плагин канала бесед, Client-Server API и шифрование — matrix-sdk.
+    ("postman-backend-matrix", L2B),
     ("postman-gpui", L3),
     // Сборка поставки (S8-47): программа CI, от крейтов рабочей области не зависит.
     ("postman-pack", L1),
@@ -52,7 +54,8 @@ const UI_CRATES: &[&str] = &["gpui", "egui", "eframe", "winit", "rfd"];
 /// Протокольные клиенты серверов (L1, ADR 0003): каждый знает только свой плагин. Новый протокол — сюда.
 /// `ldap3` — клиент каталога (S5-12 Ф5): чужой крейт, но протокол — только для своего плагина.
 /// `grammers-mtsender` — MTProto канала Telegram (ADR 0012 п. 12): только плагину `backend-telegram`.
-const PROTOCOL_CRATES: &[&str] = &["postman-jmap", "postman-imap", "postman-dav", "postman-ews", "ldap3", "grammers-mtsender"];
+/// `matrix-sdk` — Client-Server API Matrix (ADR 0012 п. 12, CH-05): только плагину `backend-matrix`.
+const PROTOCOL_CRATES: &[&str] = &["postman-jmap", "postman-imap", "postman-dav", "postman-ews", "ldap3", "grammers-mtsender", "matrix-sdk"];
 
 /// Плагины путей (L2b, ADR 0004) и их протоколы. Новый плагин — сюда (EWS — `postman-backend-ews`, S7-06б).
 const PLUGINS: &[(&str, &str)] = &[
@@ -62,6 +65,7 @@ const PLUGINS: &[(&str, &str)] = &[
     ("postman-backend-ews", "postman-ews"),
     ("postman-backend-ldap", "ldap3"),
     ("postman-backend-telegram", "grammers-mtsender"),
+    ("postman-backend-matrix", "matrix-sdk"),
 ];
 
 const CORE: &str = "postman-core";

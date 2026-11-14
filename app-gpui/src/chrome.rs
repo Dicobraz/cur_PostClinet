@@ -415,8 +415,8 @@ impl Mailer {
         // «Закрыть вкладку (Ctrl+W)»: подсказка и плашка KeyTips у активной (S5-18).
         let close_tip = crate::keytips::tip("tab.close", cx);
         let close_key = crate::keytips::key("tab.close", cx);
-        // macOS (макет `MainMac`): вкладки — только объекты; главную вкладку представляют разделы.
-        let tabs = self.tabs.iter().filter(|t| !(mac && t.kind == TabKind::Main)).map(|t| {
+        // Вкладки — только открытые объекты (решение владельца 2026-11-13); главную вкладку представляют разделы.
+        let tabs = self.tabs.iter().filter(|t| t.kind != TabKind::Main).map(|t| {
             let on = t.id == active;
             let id = t.id;
             let close = t.kind.closable().then(|| {
@@ -450,7 +450,6 @@ impl Mailer {
             let close = close.map(|c| crate::keytips::badge(c, close_key.clone().filter(|_| on), l, cx));
             let (title, dirty) = self.tab_title(t, cx);
             let full = title.clone();
-            let letter = matches!(t.kind, TabKind::Compose(_));
             let tab = div()
                 .id(("tab", id as usize))
                 .group(group)
@@ -461,31 +460,19 @@ impl Mailer {
                 .flex()
                 .items_center()
                 .gap(px(8.));
-            #[cfg(not(target_os = "macos"))]
-            let tab = tab
-                .pl(px(14.))
-                .pr(px(if close.is_some() { 6. } else { 14. }))
-                .rounded_t(l.px(Metric::RadiusOverlay))
-                .when(on, |d| d.bg(l.panel()).text_color(l.text()))
-                .when(!on, |d| d.text_color(l.text2()).hover(|d| d.bg(l.hover())))
-                .when(letter, |d| d.child(icon(glyph::NEW_MAIL, 12.)))
-                .when(t.kind == TabKind::Meeting, |d| d.child(icon(crate::calendar::g::CALENDAR, 13.)))
-                .when(t.kind == TabKind::Mail, |d| d.child(icon(glyph::MAIL, 12.)));
-            // macOS (макет `MainMac`): без плашки, активная — полужирная и подчёркнута акцентом; значок 16 px по типу.
-            #[cfg(target_os = "macos")]
-            let tab = {
-                let (ico, tint) = match t.kind {
-                    TabKind::Meeting => (icons::CALENDAR, Some(Pm::IconPink)),
-                    TabKind::Settings => (icons::SETTINGS, None),
-                    _ => (icons::MAIL, Some(Pm::IconBlue)),
-                };
-                let _ = letter;
-                tab.pl(px(12.))
-                    .pr(px(if close.is_some() { 6. } else { 10. }))
-                    .when(on, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(l.text()).border_b_2().border_color(l.accent_text()))
-                    .when(!on, |d| d.text_color(l.text2()).hover(|d| d.bg(l.hover())))
-                    .child(icons::icon(ico, 16., tint.map_or(l.text2(), |p| l.pm(p))))
+            // Вкладка (DESIGN «Главное окно», MAC-08): без плашки, активная — полужирная и подчёркнута акцентом; значок
+            // 16 px по типу объекта, цветом раздела.
+            let (ico, tint) = match t.kind {
+                TabKind::Meeting => (icons::CALENDAR, Some(Pm::IconPink)),
+                TabKind::Settings => (icons::SETTINGS, None),
+                _ => (icons::MAIL, Some(Pm::IconBlue)),
             };
+            let tab = tab
+                .pl(px(12.))
+                .pr(px(if close.is_some() { 6. } else { 10. }))
+                .when(on, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(l.text()).border_b_2().border_color(l.accent_text()))
+                .when(!on, |d| d.text_color(l.text2()).hover(|d| d.bg(l.hover())))
+                .child(icons::icon(ico, 16., tint.map_or(l.text2(), |p| l.pm(p))));
             tab.child(div().flex_1().min_w_0().truncate().child(title))
                 // Несохранённый черновик — точка (DESIGN «Новое письмо», макет вкладки).
                 .when(dirty, |d| {

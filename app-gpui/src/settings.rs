@@ -241,6 +241,7 @@ impl Mailer {
             SettingsEvent::ApplyRule(rule) => self.apply_rule(rule.clone(), cx),
             SettingsEvent::Telegram(ev) => self.on_telegram(ev.clone(), cx),
             SettingsEvent::Matrix(ev) => self.on_matrix(ev.clone(), cx),
+            SettingsEvent::Smart(i, on) => self.chat_smart_shown(*i, *on, cx),
         }
     }
 

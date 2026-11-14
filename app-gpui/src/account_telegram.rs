@@ -18,7 +18,8 @@ use postman_core::prefs::Prefs;
 
 use crate::buttons::button;
 use crate::roles::Look;
-use crate::settings_tab::{group, link, row, toggle};
+use crate::settings_channels::account_row;
+use crate::settings_tab::{group, link, row, seg, seg_group, toggle};
 
 /// Id канала.
 pub(crate) const TELEGRAM: &str = "telegram";
@@ -112,6 +113,22 @@ impl Panel {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let subs = vec![cx.observe_global::<Lines>(|_, cx| cx.notify())];
         Self { card: None, _subs: subs }
+    }
+
+    /// Карточка входа открыта.
+    pub(crate) fn signing_in(&self) -> bool {
+        self.card.is_some()
+    }
+
+    /// Сцена снимков `chat-login`: шаг «Код» с отказом сервера — без потока входа и сети.
+    pub(crate) fn screen_code_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (answers, _) = tokio::sync::mpsc::unbounded_channel();
+        let text = cx.new(|cx| InputState::new(window, cx));
+        let password = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let prompt = Some(Prompt::Code { via: CodeVia::App, length: Some(5) });
+        let error = Some(error_text(&ChannelError::Denied("code-invalid".into())));
+        self.card = Some(Card { prompt, busy: false, error, text, password, answers, qr: None });
+        cx.notify();
     }
 
     /// «Добавить учётку Telegram»: поток входа и первый вопрос.
@@ -215,6 +232,43 @@ impl Panel {
         }
     }
 
+    /// Шаги входа «Телефон → Код → Пароль» (текущий — акцентом) и способ «По номеру | По QR-коду».
+    fn steps(&self, l: &Look, cx: &mut Context<Self>) -> Option<Div> {
+        let card = self.card.as_ref()?;
+        let prompt = card.prompt.as_ref()?;
+        let at = step_of(prompt);
+        let qr = matches!(prompt, Prompt::Qr { .. });
+        let mut steps = div().flex().items_center().gap(px(6.)).text_size(px(12.));
+        for (i, key) in ["tg-step-phone", "tg-step-code", "tg-step-password"].into_iter().enumerate() {
+            if i > 0 {
+                steps = steps.child(div().text_color(l.text3()).child("→"));
+            }
+            let on = !qr && at == Some(i);
+            steps = steps.child(
+                div()
+                    .when(on, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(l.accent_text()))
+                    .when(!on, |d| d.text_color(l.text2()))
+                    .child(tr!(key)),
+            );
+        }
+        // Способ входа меняется только на первом шаге и на экране QR.
+        let free = !card.busy || qr;
+        let by_phone = seg("tg-by-phone", tr!("tg-by-phone"), !qr, free, l).when(qr, |s| {
+            s.on_click(cx.listener(|p, _, _, cx| {
+                // Ожидание QR прервать нельзя без ответа потока: ответ «телефон» уйдёт следом.
+                if let Some(c) = &mut p.card {
+                    let _ = c.answers.send(Some(Answer::Confirm(false)));
+                    c.busy = true;
+                }
+                cx.notify();
+            }))
+        });
+        let first = matches!(prompt, Prompt::Phone);
+        let by_qr = seg("tg-by-qr", tr!("tg-by-qr"), qr, first && free, l)
+            .when(first && !qr, |s| s.on_click(cx.listener(|p, _, _, cx| p.send(Answer::Confirm(true), cx))));
+        Some(div().flex().flex_wrap().items_center().gap_3().child(seg_group([by_phone, by_qr], l)).child(div().flex_1()).child(steps))
+    }
+
     fn card(&self, l: &Look, cx: &mut Context<Self>) -> Div {
         let Some(card) = &self.card else { return div() };
         let mut body = div()
@@ -226,7 +280,8 @@ impl Panel {
             .border_1()
             .border_color(l.border())
             .bg(l.panel())
-            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(tr!("tg-signin-title")));
+            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(tr!("tg-signin-title")))
+            .children(self.steps(l, cx));
         let field = |label: String, input: &Entity<InputState>, hint: Option<String>| {
             div()
                 .flex()
@@ -242,14 +297,9 @@ impl Panel {
         match &card.prompt {
             None => body = body.child(div().text_color(l.text2()).child(tr!("tg-connecting"))),
             Some(Prompt::Phone) => {
-                body = body.child(field(tr!("tg-phone"), &card.text, Some(tr!("tg-phone-hint")))).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(next(tr!("tg-get-code")))
-                        .child(link("tg-qr", tr!("tg-use-qr"), l).on_click(cx.listener(|p, _, _, cx| p.send(Answer::Confirm(true), cx)))),
-                );
+                body = body
+                    .child(field(tr!("tg-phone"), &card.text, Some(tr!("tg-phone-hint"))))
+                    .child(div().flex().items_center().gap_2().child(next(tr!("tg-get-code"))));
             }
             Some(Prompt::Code { via, length }) => {
                 let via = match via {
@@ -273,21 +323,13 @@ impl Panel {
                 body = body.child(field(tr!("tg-password"), &card.password, hint)).child(next(tr!("tg-sign-in")));
             }
             Some(Prompt::Qr { .. }) => {
-                body = body.child(div().text_color(l.text2()).child(tr!("tg-qr-hint"))).when_some(card.qr.clone(), |d, q| d.child(q.view(l))).child(
-                    link("tg-phone-back", tr!("tg-use-phone"), l).on_click(cx.listener(|p, _, _, cx| {
-                        // Ожидание QR прервать нельзя без ответа потока: ответ «телефон» уйдёт следом.
-                        if let Some(c) = &mut p.card {
-                            let _ = c.answers.send(Some(Answer::Confirm(false)));
-                            c.busy = true;
-                        }
-                        cx.notify();
-                    })),
-                );
+                body = body.child(div().text_color(l.text2()).child(tr!("tg-qr-hint"))).when_some(card.qr.clone(), |d, q| d.child(q.view(l)));
             }
             Some(_) => body = body.child(div().text_color(l.warning()).child(tr!("tg-err-other"))),
         }
+        // Ошибка входа — красной строкой (безопасность).
         if let Some(e) = &card.error {
-            body = body.child(div().text_color(l.warning()).child(e.clone()));
+            body = body.child(div().id("tg-error").text_color(l.error()).child(e.clone()));
         }
         if busy && card.prompt.is_some() && !matches!(card.prompt, Some(Prompt::Qr { .. })) {
             body = body.child(div().text_size(px(12.)).text_color(l.text2()).child(tr!("tg-wait")));
@@ -327,9 +369,10 @@ impl Render for Panel {
             };
             let name = if line.name.is_empty() { line.account.account.0.clone() } else { line.name.clone() };
             let account = line.account.clone();
-            out = out.child(row(
+            out = out.child(account_row(
+                line.state.as_ref(),
                 name,
-                Some(state),
+                state,
                 link(("tg-sign-out", n), tr!("tg-sign-out"), &l)
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(PanelEvent::SignOut(account.clone())))),
                 &l,
@@ -346,6 +389,16 @@ impl Render for Panel {
             out = out.child(div().pt_3().text_size(px(12.)).text_color(l.text2()).child(tr!("tg-no-key")));
         }
         out.into_any_element()
+    }
+}
+
+/// Номер шага входа «Телефон → Код → Пароль»; у QR и прочих вопросов шага нет.
+fn step_of(p: &Prompt) -> Option<usize> {
+    match p {
+        Prompt::Phone => Some(0),
+        Prompt::Code { .. } => Some(1),
+        Prompt::Password { .. } => Some(2),
+        _ => None,
     }
 }
 

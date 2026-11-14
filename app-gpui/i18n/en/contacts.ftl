@@ -141,3 +141,4 @@ contacts-to-group-new = New group…
 contacts-added-to-group = { $name } added to "{ $group }"
 contacts-already-in-group = { $name } is already in "{ $group }"
 contacts-removed-from-group = { $name } removed from "{ $group }"
+contacts-all-channels = In all channels

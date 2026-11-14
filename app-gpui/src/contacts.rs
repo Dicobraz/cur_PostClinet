@@ -743,6 +743,8 @@ pub(crate) enum ContactsAction {
     },
     /// «Вся переписка» (T2-40): поиск `with:<адрес>` в почте.
     AllMail(String),
+    /// «Во всех каналах» (CH-04): умная папка «Человек во всех каналах» — беседы чатов и почты с ним.
+    AllChannels(crate::chats::Person),
     /// Новое письмо без адресата (Ctrl+N без выбранной записи).
     WriteBlank,
     /// Поиск в справочнике по строке (`Command::FindPeople`, S7-08): у Exchange справочник — только поиском.
@@ -2484,7 +2486,20 @@ impl ContactsView {
                     .cursor_pointer()
                     .child(tr!("contacts-all-mail"))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(ContactsAction::AllMail(email.clone())))),
-            );
+            )
+            // «Во всех каналах» (CH-04): беседы с человеком в почте и чатах — умной папкой.
+            .children(self.selected_entry().map(|e| {
+                let person = crate::chats::Person { name: e.card.name.clone(), addresses: postman_core::channel::index::contact_addresses(&e.card) };
+                div()
+                    .id("all-channels")
+                    .relative()
+                    .children(crate::screens::spot("all-channels"))
+                    .text_size(px(12.))
+                    .text_color(l.accent_text())
+                    .cursor_pointer()
+                    .child(tr!("contacts-all-channels"))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ContactsAction::AllChannels(person.clone()))))
+            }));
         let note = |text: String| div().p(px(14.)).text_color(l.text2()).child(text).into_any_element();
         let rows: Vec<AnyElement> = match &self.mail.letters {
             None => vec![note(tr!("contacts-mail-loading"))],
@@ -3097,6 +3112,10 @@ impl crate::Mailer {
             }
             ContactsAction::Letters { ticket, email } => {
                 self.contacts_letters(*ticket, email.clone(), cx);
+                return;
+            }
+            ContactsAction::AllChannels(person) => {
+                self.chat_person(person.clone(), cx);
                 return;
             }
             ContactsAction::AllMail(email) => {

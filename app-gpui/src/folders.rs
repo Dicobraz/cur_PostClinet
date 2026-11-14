@@ -139,8 +139,10 @@ pub(crate) enum FolderEvent {
     Letters(crate::local::DraggedLetters, String),
     /// «Экспорт…» папки или группы «На этом компьютере» (S8-32).
     Export(String),
-    /// Строка учётки канала (CH-04): её беседы — в список.
+    /// Строка учётки канала или умной папки (CH-04): её беседы — в список.
     Chat(crate::chats::Scope),
+    /// Убрать умную папку человека из дерева.
+    ChatForget(crate::chats::Person),
 }
 
 /// Что правится полем в дереве.
@@ -359,6 +361,12 @@ impl Folders {
         if let Some(last) = self.rows().len().checked_sub(1) {
             self.scroll.scroll_to_item(last);
         }
+    }
+
+    /// Сцены бесед каналов: дерево — к началу, где «Умные папки».
+    pub(crate) fn screen_scroll_top(&mut self, cx: &mut Context<Self>) {
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
     }
 
     /// Сцены бесед каналов: дерево — у нижнего края, где разделы учёток каналов.
@@ -1079,6 +1087,10 @@ impl Render for Folders {
                 rows.push(self.favorite_row(m, &l, cx));
             }
             rows.push(div().h(px(1.)).mx(px(8.)).my(px(6.)).flex_none().bg(l.border()).into_any_element());
+        }
+        // «Умные папки» (CH-04, DESIGN «Каналы») — под «Избранным», пока подключён хоть один канал.
+        if self.results.is_none() {
+            rows.extend(self.smart_rows(&l, cx));
         }
         for r in self.rows() {
             match r {

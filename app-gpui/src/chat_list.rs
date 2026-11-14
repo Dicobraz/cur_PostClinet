@@ -61,6 +61,8 @@ pub(crate) struct ChatList {
     list: ListState,
     /// Экран почты в фокусе (выделенная строка — тоном акцента).
     pub(crate) focused: bool,
+    /// Пустое состояние: ключи заголовка и фразы — по тому, что показано (папка канала, умная папка).
+    pub(crate) empty: (&'static str, &'static str),
 }
 
 impl ChatList {
@@ -72,6 +74,7 @@ impl ChatList {
             mixed: false,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             focused: true,
+            empty: ("chats-empty-list-title", "chats-empty-list-text"),
         }
     }
 
@@ -97,6 +100,11 @@ impl ChatList {
 
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Первая беседа списка (сцены).
+    pub(crate) fn first(&self) -> Option<Address> {
+        self.rows.first().map(|r| r.at().clone())
     }
 
     /// Шаг по беседам (клавиши списка): выбранная — в видимую область; беседа не выбрана — первая.
@@ -143,7 +151,8 @@ impl ChatList {
         let lit = self.selected.as_ref() == Some(r.at());
         let unread = r.item.counts.unread;
         let roomy = !l.compact();
-        let face = crate::tape::avatar(&c.title, 32., 12., l);
+        let title = r.title();
+        let face = crate::tape::avatar(&title, 32., 12., l);
         // Значок канала 16 px в углу аватара — только в смешанных папках.
         let face = div().relative().flex_none().size(px(32.)).child(face).when(self.mixed, |d| {
             d.child(
@@ -165,7 +174,7 @@ impl ChatList {
             .flex()
             .items_center()
             .gap(px(6.))
-            .child(div().flex_1().min_w_0().truncate().when(unread > 0, |d| d.font_weight(FontWeight::SEMIBOLD)).child(c.title.clone()))
+            .child(div().flex_1().min_w_0().truncate().when(unread > 0, |d| d.font_weight(FontWeight::SEMIBOLD)).child(title))
             .when(c.encrypted, |d| d.child(icon(glyph::LOCK, 12.).text_color(l.text3())))
             .when(r.item.pinned, |d| d.child(icon(glyph::PIN, 12.).text_color(l.text3())))
             .when(r.item.muted, |d| d.child(icon(glyph::MUTED, 12.).text_color(l.text3())))
@@ -188,23 +197,19 @@ impl ChatList {
         });
         let mention = (r.item.counts.mentions > 0)
             .then(|| div().flex_none().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(l.accent_text()).child("@"));
-        let last = div()
-            .flex()
-            .items_start()
-            .gap(px(6.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(l.px(Metric::TypeCaption))
-                    .line_height(px(18.))
-                    .text_color(l.text2())
-                    .when(roomy, |d| d.line_clamp(2))
-                    .when(!roomy, |d| d.truncate())
-                    .child(r.last_line()),
-            )
-            .children(mention)
-            .children(badge);
+        // Чат — «Автор: последнее сообщение» в две строки; письмо — тема и начало текста, по строке.
+        let caption = || div().text_size(l.px(Metric::TypeCaption)).line_height(px(18.)).text_color(l.text2());
+        let text = if r.is_mail() {
+            let c = &r.item.summary;
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(caption().truncate().text_color(l.text()).child(c.conversation.title.clone()))
+                .when(roomy, |d| d.child(caption().truncate().child(c.preview.clone())))
+        } else {
+            div().flex_1().min_w_0().child(caption().when(roomy, |d| d.line_clamp(2)).when(!roomy, |d| d.truncate()).child(r.last_line()))
+        };
+        let last = div().flex().items_start().gap(px(6.)).child(text).children(mention).children(badge);
         let at = r.at().clone();
         let id = SharedString::from(format!("chat-row-{i}"));
         div()
@@ -243,8 +248,7 @@ impl Render for ChatList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let l = look(cx);
         if self.rows.is_empty() {
-            return crate::chat_pane::empty_state(glyph::CONVERSATION, tr!("chats-empty-list-title"), tr!("chats-empty-list-text"), &l)
-                .into_any_element();
+            return crate::chat_pane::empty_state(glyph::CONVERSATION, tr!(self.empty.0), tr!(self.empty.1), &l).into_any_element();
         }
         let rows = list(self.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.item(ix, cx))).size_full();
         div()
@@ -269,7 +273,7 @@ mod tests {
     fn row(id: &str, pinned: bool) -> Row {
         let address = Address::conversation(&ChannelId::new("demo"), &AccountId::new("me@example.test"), &ConversationId::new(id));
         let summary = Summary { address, conversation: Conversation::default(), last: 0, preview: String::new(), author: None };
-        Row { item: Item { summary, counts: Counts::default(), muted: false, pinned }, author: String::new(), mine: false }
+        Row { item: Item { summary, counts: Counts::default(), muted: false, pinned }, author: String::new(), mine: false, poll: String::new() }
     }
 
     /// Закреплённые — группой сверху; без закреплённых — без подписей групп.

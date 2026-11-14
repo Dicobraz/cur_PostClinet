@@ -11,10 +11,11 @@ use gpui_kit::*;
 use pets_i18n::tr;
 use pets_ui::Level as Toast;
 use postman_cache::Cache;
+use postman_core::channel::mail::{MailAccount, MailSource};
 use postman_core::channel::smart::{self, Item};
 use postman_core::channel::{
-    Action, Address, ChanAccount, ChannelError, ChannelFeatures, ChannelFolder, ChannelStore, Counts, FolderRef, Message, MessageId, ParticipantId,
-    Request, Role, Update, outbox,
+    Action, Address, ChanAccount, ChannelError, ChannelFeatures, ChannelFolder, ChannelStore, ConversationSource, Counts, FolderRef, Message,
+    MessageId, ParticipantId, Request, Role, Update, outbox,
 };
 use postman_core::sync::Command;
 
@@ -69,6 +70,50 @@ enum BarAct {
 
 const TEXTS: &[pets_i18n::Resource] = &[("ru", include_str!("../i18n/ru/chats.ftl")), ("en", include_str!("../i18n/en/chats.ftl"))];
 
+/// Человек умной папки «Человек во всех каналах»: имя и его адреса (почта, телефоны, адреса в мессенджерах).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Person {
+    pub(crate) name: String,
+    pub(crate) addresses: Vec<String>,
+}
+
+/// Умная папка поверх всех каналов (ADR 0012 «Вид»): в ней беседы чатов и почты.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Smart {
+    /// «Непрочитанное везде».
+    Unread,
+    /// «Упоминания меня».
+    Mentions,
+    /// «Закреплённые».
+    Pinned,
+    /// «Человек во всех каналах» — с карточки контакта.
+    Person(Person),
+}
+
+impl Smart {
+    /// Три постоянные папки по порядку дерева (людей добавляет пользователь).
+    pub(crate) const FIXED: [Smart; 3] = [Smart::Unread, Smart::Mentions, Smart::Pinned];
+
+    fn folder(&self) -> smart::Folder {
+        match self {
+            Smart::Unread => smart::Folder::Unread,
+            Smart::Mentions => smart::Folder::Mentions,
+            Smart::Pinned => smart::Folder::Pinned,
+            Smart::Person(p) => smart::Folder::Person(p.addresses.clone()),
+        }
+    }
+
+    /// Название в дереве.
+    pub(crate) fn title(&self) -> String {
+        match self {
+            Smart::Unread => tr!("chats-smart-unread"),
+            Smart::Mentions => tr!("chats-smart-mentions"),
+            Smart::Pinned => tr!("chats-smart-pinned"),
+            Smart::Person(p) => p.name.clone(),
+        }
+    }
+}
+
 /// Что показано в списке вместо папки почты.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Scope {
@@ -76,13 +121,22 @@ pub(crate) enum Scope {
     All(ChanAccount),
     /// Папка Telegram, пространство Matrix.
     Folder(ChanAccount, FolderRef),
+    /// Умная папка: беседы всех каналов и почты.
+    Smart(Smart),
 }
 
 impl Scope {
-    pub(crate) fn account(&self) -> &ChanAccount {
+    /// Учётка канала, чьи беседы показаны; у умной папки её нет.
+    pub(crate) fn account(&self) -> Option<&ChanAccount> {
         match self {
-            Scope::All(a) | Scope::Folder(a, _) => a,
+            Scope::All(a) | Scope::Folder(a, _) => Some(a),
+            Scope::Smart(_) => None,
         }
+    }
+
+    /// Смешанный список (значок канала у строки).
+    pub(crate) fn mixed(&self) -> bool {
+        matches!(self, Scope::Smart(_))
     }
 }
 
@@ -92,6 +146,8 @@ pub(crate) struct Row {
     pub(crate) item: Item,
     pub(crate) author: String,
     pub(crate) mine: bool,
+    /// Вопрос опроса в последнем сообщении (если оно без текста).
+    pub(crate) poll: String,
 }
 
 impl Row {
@@ -99,9 +155,26 @@ impl Row {
         &self.item.summary.address
     }
 
-    /// Строки 2–3 списка: «Автор: последнее сообщение»; в личной беседе чужое — без автора.
+    /// Беседа почты (в умной папке): строка — отправитель, тема, начало текста.
+    pub(crate) fn is_mail(&self) -> bool {
+        self.at().channel.0 == postman_core::channel::MAIL
+    }
+
+    /// Первая строка: название беседы; у письма — отправитель.
+    pub(crate) fn title(&self) -> String {
+        if self.is_mail() && !self.author.is_empty() { self.author.clone() } else { self.item.summary.conversation.title.clone() }
+    }
+
+    /// Строки 2–3 списка: «Автор: последнее сообщение»; в личной беседе чужое — без автора; у письма — тема и начало
+    /// текста.
     pub(crate) fn last_line(&self) -> String {
-        let text = &self.item.summary.preview;
+        if self.is_mail() {
+            let (subject, text) = (self.item.summary.conversation.title.trim(), self.item.summary.preview.trim());
+            return if text.is_empty() { subject.to_owned() } else { format!("{subject}\n{text}") };
+        }
+        // Сообщение без текста с опросом — его вопрос (довесок разбирает `chat_extra`).
+        let poll = if self.poll.is_empty() { String::new() } else { tr!("chats-poll-line", question = self.poll.clone()) };
+        let text = if self.item.summary.preview.is_empty() { &poll } else { &self.item.summary.preview };
         let direct = self.item.summary.conversation.kind == postman_core::channel::ConversationKind::Direct;
         if self.mine {
             tr!("chats-last-mine", text = text.clone())
@@ -128,47 +201,106 @@ pub(crate) struct Account {
 pub(crate) struct Snapshot {
     pub(crate) accounts: Vec<Account>,
     pub(crate) rows: Vec<Row>,
+    /// Умные папки, показанные в дереве, и их беседы (чаты и почта).
+    pub(crate) smart: Vec<(Smart, Vec<Row>)>,
+    /// Какие из трёх постоянных умных папок показывать (порядок [`Smart::FIXED`]).
+    pub(crate) shown: [bool; 3],
 }
 
 impl Snapshot {
     /// Беседа входит в то, что показано.
     fn holds(&self, scope: &Scope, row: &Row) -> bool {
-        if row.at().chan() != *scope.account() {
-            return false;
-        }
         match scope {
-            Scope::All(_) => true,
+            Scope::All(chan) => row.at().chan() == *chan,
             Scope::Folder(chan, folder) => {
                 let id = &row.at().conversation;
-                row.item.summary.conversation.folders.contains(folder)
-                    || self
-                        .accounts
-                        .iter()
-                        .filter(|a| a.chan == *chan)
-                        .flat_map(|a| &a.folders)
-                        .any(|f| f.id == *folder && f.conversations.contains(id))
+                row.at().chan() == *chan
+                    && (row.item.summary.conversation.folders.contains(folder)
+                        || self
+                            .accounts
+                            .iter()
+                            .filter(|a| a.chan == *chan)
+                            .flat_map(|a| &a.folders)
+                            .any(|f| f.id == *folder && f.conversations.contains(id)))
             }
+            Scope::Smart(_) => false,
         }
     }
 
     /// Строки списка: закреплённые сверху, дальше новые первыми (порядок снимка — `smart::arrange`).
     pub(crate) fn rows_of(&self, scope: &Scope) -> Vec<Row> {
-        self.rows.iter().filter(|r| self.holds(scope, r)).cloned().collect()
+        match scope {
+            Scope::Smart(s) => self.smart.iter().find(|(x, _)| x == s).map(|(_, rows)| rows.clone()).unwrap_or_default(),
+            _ => self.rows.iter().filter(|r| self.holds(scope, r)).cloned().collect(),
+        }
     }
 
     /// Счётчик у строки дерева: непрочитанное и упоминания, кроме заглушённых.
     pub(crate) fn counts(&self, scope: &Scope) -> Counts {
-        let items: Vec<Item> = self.rows.iter().filter(|r| self.holds(scope, r)).map(|r| r.item.clone()).collect();
+        let items: Vec<Item> = match scope {
+            Scope::Smart(s) => self.smart.iter().filter(|(x, _)| x == s).flat_map(|(_, rows)| rows.iter().map(|r| r.item.clone())).collect(),
+            _ => self.rows.iter().filter(|r| self.holds(scope, r)).map(|r| r.item.clone()).collect(),
+        };
         smart::totals(&items)
     }
 
     pub(crate) fn account(&self, chan: &ChanAccount) -> Option<&Account> {
         self.accounts.iter().find(|a| a.chan == *chan)
     }
+
+    /// Люди умных папок «Человек во всех каналах».
+    pub(crate) fn people(&self) -> Vec<Person> {
+        self.smart
+            .iter()
+            .filter_map(|(s, _)| match s {
+                Smart::Person(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-/// Снимок из базы профиля (I/O — только из фона). `on` — включён ли канал (настройка и политика).
-pub(crate) fn snapshot(cache: &Cache, now: i64, on: &dyn Fn(&str) -> bool) -> Result<Snapshot, ChannelError> {
+/// Ключи базы профиля (`local`): какие умные папки показывать и люди «Человек во всех каналах».
+const SMART_SHOWN: &str = "ui/smart/shown";
+const SMART_PEOPLE: &str = "ui/smart/people";
+
+/// Какие постоянные умные папки показывать; записи нет — все.
+pub(crate) fn smart_shown(cache: &Cache) -> Result<[bool; 3], ChannelError> {
+    let stored = cache.local(SMART_SHOWN)?.map(|d| d.value);
+    Ok(match stored.as_deref() {
+        Some([a, b, c]) => [*a != 0, *b != 0, *c != 0],
+        _ => [true; 3],
+    })
+}
+
+pub(crate) fn set_smart_shown(cache: &Cache, shown: [bool; 3]) -> Result<(), ChannelError> {
+    Ok(cache.put_local(&postman_cache::LocalPut { key: SMART_SHOWN.into(), value: shown.map(u8::from).to_vec(), parts: Vec::new() })?)
+}
+
+/// Люди умных папок: строка на человека — имя и адреса через табуляцию.
+pub(crate) fn smart_people(cache: &Cache) -> Result<Vec<Person>, ChannelError> {
+    let Some(doc) = cache.local(SMART_PEOPLE)? else { return Ok(Vec::new()) };
+    let text = String::from_utf8_lossy(&doc.value).into_owned();
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t').map(str::trim).filter(|f| !f.is_empty());
+            let name = fields.next()?.to_owned();
+            Some(Person { name, addresses: fields.map(str::to_owned).collect() })
+        })
+        .collect())
+}
+
+pub(crate) fn set_smart_people(cache: &Cache, people: &[Person]) -> Result<(), ChannelError> {
+    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    let text: Vec<String> =
+        people.iter().map(|p| std::iter::once(clean(&p.name)).chain(p.addresses.iter().map(|a| clean(a))).collect::<Vec<_>>().join("\t")).collect();
+    Ok(cache.put_local(&postman_cache::LocalPut { key: SMART_PEOPLE.into(), value: text.join("\n").into_bytes(), parts: Vec::new() })?)
+}
+
+/// Снимок из базы профиля (I/O — только из фона). `on` — включён ли канал (настройка и политика); `mail` — почта для
+/// умных папок (без неё в них только чаты).
+pub(crate) fn snapshot(cache: &Cache, now: i64, on: &dyn Fn(&str) -> bool, mail: Option<&MailSource>) -> Result<Snapshot, ChannelError> {
     let stores: Vec<ChannelStore> = ChannelStore::all(cache)?.into_iter().filter(|s| on(&s.channel().0)).collect();
     let mut accounts = Vec::new();
     let mut me = Vec::new();
@@ -181,10 +313,10 @@ pub(crate) fn snapshot(cache: &Cache, now: i64, on: &dyn Fn(&str) -> bool) -> Re
         me.push(who.map(|p| p.id));
         accounts.push(Account { chan: s.chan(), name, features: s.features()?, folders: s.folders()? });
     }
-    let mut rows = Vec::new();
-    for item in smart::all_chats(cache, now)? {
+    // Строка беседы чата; беседа выключенного канала — `None`.
+    let chat_row = |item: Item| -> Result<Option<Row>, ChannelError> {
         let chan = item.summary.address.chan();
-        let Some(i) = stores.iter().position(|s| s.chan() == chan) else { continue };
+        let Some(i) = stores.iter().position(|s| s.chan() == chan) else { return Ok(None) };
         let (author, mine) = match &item.summary.author {
             Some(id) => {
                 let name = stores[i].participant(id)?.map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| id.0.clone());
@@ -192,9 +324,53 @@ pub(crate) fn snapshot(cache: &Cache, now: i64, on: &dyn Fn(&str) -> bool) -> Re
             }
             None => (String::new(), false),
         };
-        rows.push(Row { item, author, mine });
+        // Последнее сообщение без текста: вопрос опроса из довеска канала.
+        let poll = if item.summary.preview.is_empty() {
+            let last = stores[i].timeline(&item.summary.address.conversation, None, 1)?.pop();
+            last.as_ref().and_then(|e| e.message()).and_then(|m| crate::chat_extra::summary(&chan.channel.0, &m.extra)).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(Some(Row { item, author, mine, poll }))
+    };
+    let mut rows = Vec::new();
+    for item in smart::all_chats(cache, now)? {
+        rows.extend(chat_row(item)?);
     }
-    Ok(Snapshot { accounts, rows })
+    // Умные папки — пока подключён хоть один канал: без каналов дерево почты прежнее.
+    let shown = smart_shown(cache)?;
+    let mut smart_rows = Vec::new();
+    if !accounts.is_empty() {
+        let fixed = Smart::FIXED.into_iter().zip(shown).filter(|(_, on)| *on).map(|(s, _)| s);
+        for s in fixed.chain(smart_people(cache)?.into_iter().map(Smart::Person)) {
+            let mut list = Vec::new();
+            for item in smart::folder(cache, mail, &s.folder(), now)? {
+                if item.summary.address.channel.0 != postman_core::channel::MAIL {
+                    list.extend(chat_row(item)?);
+                    continue;
+                }
+                // Письмо: отправитель последнего письма беседы — именем.
+                let author = match mail.map(|m| m.timeline(&item.summary.address, None, 1)).transpose()?.and_then(|mut l| l.pop()) {
+                    Some(line) => {
+                        let at = Address { message: Some(line.id().clone()), ..item.summary.address.clone() };
+                        let row = mail.map(|m| m.find(&at)).transpose()?.flatten().map(|(row, _)| row);
+                        row.map(|r| if r.from_name.is_empty() { r.from_addr } else { r.from_name }).unwrap_or_default()
+                    }
+                    None => String::new(),
+                };
+                list.push(Row { item, author, mine: false, poll: String::new() });
+            }
+            smart_rows.push((s, list));
+        }
+    }
+    Ok(Snapshot { accounts, rows, smart: smart_rows, shown })
+}
+
+/// Письмо беседы почты для области чтения (умная папка): последнее письмо беседы. I/O — из фона.
+pub(crate) fn mail_row(mail: &MailSource, at: &Address) -> Result<Option<postman_cache::EmailRow>, ChannelError> {
+    let Some(line) = mail.timeline(at, None, 1)?.pop() else { return Ok(None) };
+    let at = Address { message: Some(line.id().clone()), ..at.clone() };
+    Ok(mail.find(&at)?.map(|(row, _)| row))
 }
 
 /// Что из своего у канала показать у сообщения и беседы — по возможностям учётки («Нет у сервера — нет на экране»).
@@ -262,6 +438,10 @@ pub(crate) struct Chats {
     again: bool,
     /// Номер запроса учётке (`Request::Act`): ответ — `Update::Acted` с ним.
     ticket: u64,
+    /// Запросы действий довеска (кнопка бота, голос): их ответ — ленте.
+    extra: Vec<u64>,
+    /// В умной папке открыта беседа почты: в области чтения — письмо, кнопки — письма.
+    pub(crate) mail_open: bool,
 }
 
 impl Chats {
@@ -274,7 +454,10 @@ impl Chats {
             }),
             cx.subscribe(&pane, |this: &mut Mailer, _, ev: &PaneEvent, cx| this.on_chat_pane(ev, cx)),
         ];
-        (Self { snapshot: Arc::default(), scope: None, list, pane, loading: false, again: false, ticket: 0 }, subs)
+        (
+            Self { snapshot: Arc::default(), scope: None, list, pane, loading: false, again: false, ticket: 0, extra: Vec::new(), mail_open: false },
+            subs,
+        )
     }
 }
 
@@ -294,13 +477,15 @@ impl Mailer {
         let cache = self.cache.clone();
         let prefs = crate::prefs::get(cx);
         let (telegram, matrix) = (crate::account_telegram::enabled(&prefs), crate::account_matrix::enabled(&prefs));
+        let (mail_accounts, me) = self.mail_ctx(cx);
         let task = cx.background_spawn(async move {
             let on = |id: &str| match id {
                 crate::account_telegram::TELEGRAM => telegram,
                 crate::account_matrix::MATRIX => matrix,
                 _ => true,
             };
-            snapshot(&cache, now_ms(), &on)
+            let mail = MailSource::new(cache.clone(), mail_accounts, me);
+            snapshot(&cache, now_ms(), &on, Some(&mail))
         });
         cx.spawn(async move |this, cx| {
             let loaded = task.await;
@@ -322,15 +507,21 @@ impl Mailer {
         let snapshot = Arc::new(snapshot);
         let before = std::mem::replace(&mut self.chats.snapshot, snapshot.clone());
         // Учётка вышла или канал выключен, пока её беседы показаны, — назад к почте.
-        if let Some(scope) = self.chats.scope.clone()
-            && before.account(scope.account()).is_some()
-            && snapshot.account(scope.account()).is_none()
-        {
+        let gone = match self.chats.scope.as_ref() {
+            // Умная папка была в прошлом снимке и пропала (выключили, убрали человека); только что созданной папки
+            // человека в снимке, начатом до её записи, ещё нет — это не «пропала».
+            Some(Scope::Smart(s)) => before.smart.iter().any(|(x, _)| x == s) && !snapshot.smart.iter().any(|(x, _)| x == s),
+            Some(scope) => scope.account().is_some_and(|a| before.account(a).is_some() && snapshot.account(a).is_none()),
+            None => false,
+        };
+        if gone {
             self.leave_chats(cx);
             if let Some(inbox) = crate::live::inbox(&self.folders.read(cx).mailboxes) {
                 self.open_mailbox(inbox, cx);
             }
         }
+        // «Настройки → Каналы»: какие умные папки показаны.
+        cx.set_global(crate::settings_channels::SmartShown(snapshot.shown));
         let scope = self.chats.scope.clone();
         self.folders.update(cx, |f, cx| {
             f.chats = snapshot.clone();
@@ -355,10 +546,21 @@ impl Mailer {
         self.chats.scope = Some(scope.clone());
         self.chat_bar(true, cx);
         let rows = self.chats.snapshot.rows_of(&scope);
+        let mixed = scope.mixed();
+        let empty = match &scope {
+            Scope::Smart(Smart::Unread) => ("chats-empty-unread-title", "chats-empty-unread-text"),
+            Scope::Smart(Smart::Mentions) => ("chats-empty-mentions-title", "chats-empty-mentions-text"),
+            Scope::Smart(Smart::Pinned) => ("chats-empty-pinned-title", "chats-empty-pinned-text"),
+            Scope::Smart(Smart::Person(_)) => ("chats-empty-person-title", "chats-empty-person-text"),
+            Scope::All(_) | Scope::Folder(..) => ("chats-empty-list-title", "chats-empty-list-text"),
+        };
         self.chats.list.update(cx, |l, cx| {
             l.selected = None;
+            l.mixed = mixed;
+            l.empty = empty;
             l.set_rows(rows, cx);
         });
+        self.chats.mail_open = false;
         self.chats.pane.update(cx, |p, cx| p.close(cx));
         self.folders.update(cx, |f, cx| {
             f.chat_scope = Some(scope);
@@ -373,6 +575,7 @@ impl Mailer {
         if self.chats.scope.take().is_none() {
             return;
         }
+        self.chats.mail_open = false;
         self.chats.pane.update(cx, |p, cx| p.close(cx));
         self.chat_bar(false, cx);
         self.folders.update(cx, |f, cx| {
@@ -382,12 +585,50 @@ impl Mailer {
         cx.notify();
     }
 
+    /// Мои ящики и адреса — для бесед почты в умных папках.
+    fn mail_ctx(&self, cx: &App) -> (Vec<MailAccount>, postman_core::filters::Me) {
+        let folders = self.folders.read(cx);
+        let own = folders.own.clone().unwrap_or_else(|| postman_demo::ME.to_owned());
+        let mut accounts = vec![MailAccount::new(None, &own)];
+        accounts.extend(folders.accounts.iter().map(|a| MailAccount::new(Some(&a.id), &a.name)));
+        (accounts, self.list.read(cx).me.clone())
+    }
+
+    /// Беседа почты из умной папки: последнее письмо — в область чтения, кнопки — письма.
+    fn open_mail_conversation(&mut self, at: Address, cx: &mut Context<Self>) {
+        let (accounts, me) = self.mail_ctx(cx);
+        let cache = self.cache.clone();
+        let task = cx.background_spawn(async move { mail_row(&MailSource::new(cache.clone(), accounts, me), &at) });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            let _ = this.update(cx, |m, cx| match found {
+                Ok(Some(row)) if m.chat_active() => {
+                    m.chats.mail_open = true;
+                    m.chats.pane.update(cx, |p, cx| p.close(cx));
+                    m.chat_bar(false, cx);
+                    m.open_letter(row, cx);
+                    cx.notify();
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("chats: mail conversation not read: {e}"),
+            });
+        })
+        .detach();
+    }
+
     /// Беседа из списка — в область чтения.
     pub(crate) fn open_chat(&mut self, at: Address, cx: &mut Context<Self>) {
         self.chats.list.update(cx, |l, cx| {
             l.selected = Some(at.clone());
             cx.notify();
         });
+        if at.channel.0 == postman_core::channel::MAIL {
+            return self.open_mail_conversation(at, cx);
+        }
+        if std::mem::take(&mut self.chats.mail_open) {
+            self.reading.update(cx, |r, cx| r.clear(cx));
+            self.chat_bar(true, cx);
+        }
         self.chats.pane.update(cx, |p, cx| p.open(at, cx));
         cx.notify();
     }
@@ -396,8 +637,65 @@ impl Mailer {
     fn chat_step(&mut self, to: Step, cx: &mut Context<Self>) {
         let next = self.chats.list.update(cx, |l, cx| l.step(to, cx));
         if let Some(at) = next {
-            self.chats.pane.update(cx, |p, cx| p.open(at, cx));
+            self.open_chat(at, cx);
         }
+    }
+
+    /// Письма изменились: умные папки с беседами почты — перечитать.
+    pub(crate) fn chats_mail_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.chats.snapshot.smart.is_empty() {
+            self.chats_reload(cx);
+        }
+    }
+
+    /// «Настройки → Каналы»: показывать ли постоянную умную папку номер `i` в дереве.
+    pub(crate) fn chat_smart_shown(&mut self, i: usize, on: bool, cx: &mut Context<Self>) {
+        let mut shown = self.chats.snapshot.shown;
+        let Some(slot) = shown.get_mut(i) else { return };
+        *slot = on;
+        let cache = self.cache.clone();
+        self.chat_store(cx, move || set_smart_shown(&cache, shown));
+    }
+
+    /// «Человек во всех каналах» с карточки контакта: папка человека — в дерево и в список.
+    pub(crate) fn chat_person(&mut self, person: Person, cx: &mut Context<Self>) {
+        if self.chats.snapshot.accounts.is_empty() {
+            return self.toast(Toast::Info, tr!("chats-person-no-channels"), cx);
+        }
+        let mut people = self.chats.snapshot.people();
+        people.retain(|p| p.name != person.name);
+        people.push(person.clone());
+        let cache = self.cache.clone();
+        self.set_section(crate::Section::Mail, cx);
+        self.open_chat_scope(Scope::Smart(Smart::Person(person)), cx);
+        self.chat_store(cx, move || set_smart_people(&cache, &people));
+    }
+
+    /// Убрать папку человека из дерева.
+    pub(crate) fn chat_person_forget(&mut self, person: &Person, cx: &mut Context<Self>) {
+        let mut people = self.chats.snapshot.people();
+        people.retain(|p| p != person);
+        if self.chats.scope == Some(Scope::Smart(Smart::Person(person.clone()))) {
+            self.leave_chats(cx);
+            if let Some(inbox) = crate::live::inbox(&self.folders.read(cx).mailboxes) {
+                self.open_mailbox(inbox, cx);
+            }
+        }
+        let cache = self.cache.clone();
+        self.chat_store(cx, move || set_smart_people(&cache, &people));
+    }
+
+    /// Запись настроек умных папок в базу профиля (в фоне), затем — перечитать снимок.
+    fn chat_store(&mut self, cx: &mut Context<Self>, write: impl FnOnce() -> Result<(), ChannelError> + Send + 'static) {
+        let task = cx.background_spawn(async move { write() });
+        cx.spawn(async move |this, cx| {
+            let done = task.await;
+            let _ = this.update(cx, |m, cx| match done {
+                Ok(()) => m.chats_reload(cx),
+                Err(e) => m.toast(Toast::Error, error_text(&e), cx),
+            });
+        })
+        .detach();
     }
 
     /// Запрос учётке канала; потока нет (канал выключен, нет связи с потоком) — тост.
@@ -407,16 +705,23 @@ impl Mailer {
         }
     }
 
-    fn chat_act(&mut self, account: ChanAccount, action: Action, cx: &mut Context<Self>) {
+    fn chat_act(&mut self, account: ChanAccount, action: Action, cx: &mut Context<Self>) -> u64 {
         self.chats.ticket += 1;
         let ticket = self.chats.ticket;
         self.chat_request(account, Request::Act { ticket, action }, cx);
+        ticket
     }
 
     fn on_chat_pane(&mut self, ev: &PaneEvent, cx: &mut Context<Self>) {
         match ev {
             PaneEvent::Request(account, request) => self.chat_request(account.clone(), request.clone(), cx),
-            PaneEvent::Act(account, action) => self.chat_act(account.clone(), action.clone(), cx),
+            PaneEvent::Act(account, action) => {
+                self.chat_act(account.clone(), action.clone(), cx);
+            }
+            PaneEvent::Extra(account, action) => {
+                let ticket = self.chat_act(account.clone(), action.clone(), cx);
+                self.chats.extra.push(ticket);
+            }
             PaneEvent::Toast(level, text) => self.toast(*level, text.clone(), cx),
             PaneEvent::Mute(at, on) => self.chat_mute(at.clone(), *on, cx),
             PaneEvent::Pin(at, on) => self.chat_pin(at.clone(), *on, cx),
@@ -437,7 +742,7 @@ impl Mailer {
             let _ = this.update(cx, |m, cx| match done {
                 Ok(action) => {
                     if let Some(a) = action {
-                        m.chat_act(at.chan(), a, cx);
+                        let _ = m.chat_act(at.chan(), a, cx);
                     }
                     m.toast(Toast::Info, tr!(if on { "chats-muted" } else { "chats-unmuted" }), cx);
                     m.chats_reload(cx);
@@ -462,7 +767,7 @@ impl Mailer {
             let _ = this.update(cx, |m, cx| match done {
                 Ok(Ok(action)) => {
                     if let Some(a) = action {
-                        m.chat_act(at.chan(), a, cx);
+                        let _ = m.chat_act(at.chan(), a, cx);
                     }
                     m.toast(Toast::Info, tr!(if on { "chats-pinned" } else { "chats-unpinned" }), cx);
                     m.chats_reload(cx);
@@ -492,7 +797,18 @@ impl Mailer {
                 self.toast(Toast::Error, tr!("chats-send-failed", why = error_text(error)), cx);
                 self.chats.pane.update(cx, |p, cx| p.reload(cx));
             }
-            Update::Acted { result: Err(e), .. } => self.toast(Toast::Error, error_text(e), cx),
+            Update::Acted { ticket, result } => {
+                let extra = self.chats.extra.iter().position(|t| t == ticket).map(|i| self.chats.extra.swap_remove(i)).is_some();
+                match result {
+                    // Ответ бота на кнопку или голос — ленте: подсказка, предупреждение, ссылка.
+                    Ok(postman_core::channel::Done::Reply(reply)) if extra => {
+                        let reply = reply.clone();
+                        self.chats.pane.update(cx, |p, cx| p.extra_reply(reply, cx));
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.toast(Toast::Error, error_text(e), cx),
+                }
+            }
             _ => {}
         }
     }
@@ -539,7 +855,11 @@ impl Mailer {
         }
         // Панель чтения скрыта (Настройки → Чтение): беседа на месте списка — назад к списку.
         let hidden = crate::prefs::get(cx).reading.pane == postman_core::prefs::Pane::Hidden;
-        if hidden && self.chats.pane.read(cx).address().is_some() {
+        if hidden && (self.chats.mail_open || self.chats.pane.read(cx).address().is_some()) {
+            if std::mem::take(&mut self.chats.mail_open) {
+                self.reading.update(cx, |r, cx| r.clear(cx));
+                self.chat_bar(true, cx);
+            }
             self.chats.pane.update(cx, |p, cx| p.close(cx));
             self.chats.list.update(cx, |l, cx| {
                 l.selected = None;
@@ -567,7 +887,7 @@ pub(crate) mod scenes {
     use gpui_kit::*;
     use postman_core::channel::ChanAccount;
 
-    use super::Scope;
+    use super::{Person, Scope, Smart};
     use crate::screens::Scene;
     use crate::{Mailer, Section};
 
@@ -578,6 +898,18 @@ pub(crate) mod scenes {
         Scene::new("chat-direct", direct, direct_ready).continues().wait(wait),
         // Рассылка только для чтения: поля ввода нет («Нет у сервера — нет на экране»).
         Scene::new("chat-read-only", news, news_ready).continues(),
+        // Кнопки бота и опрос в ленте группы; ответ бота — предупреждением и ссылкой над полем ввода.
+        Scene::new("chat-bot", bot, bot_ready).continues().wait(wait),
+        // Умная папка «Непрочитанное везде»: беседы чатов и почты в одном списке, значок канала у аватара.
+        Scene::new("chat-smart", smart_folder, smart_ready).continues().wait(wait),
+        // `ChPerson`: «Человек во всех каналах» — папка человека в дереве, его беседы почты и чатов.
+        Scene::new("chat-person", person, person_ready).continues(),
+        // `ChEmpty`: пустая умная папка — пустые состояния списка и области чтения.
+        Scene::new("chat-empty", empty, empty_ready).continues(),
+        // `ChSettings`: «Настройки → Каналы» — каналы, политика, умные папки справа.
+        Scene::new("chat-settings", settings, settings_ready).continues(),
+        // `ChLogin`: вход в Telegram на месте — шаги, «По номеру | По QR-коду», ошибка кода красной строкой.
+        Scene::new("chat-login", login, login_ready).continues(),
     ];
 
     fn demo() -> ChanAccount {
@@ -591,6 +923,9 @@ pub(crate) mod scenes {
 
     /// Перед чужими сценами — назад к почте (сцены бесед — последние в прогоне).
     pub(crate) fn reset(s: &Scene, m: &mut Mailer, _: &mut Window, cx: &mut Context<Mailer>) {
+        if !s.name.starts_with("chat-") && crate::prefs::get(cx).channels.telegram {
+            crate::prefs::update(cx, |p| p.channels.telegram = false);
+        }
         if !s.name.starts_with("chat-") && m.chat_active() {
             m.leave_chats(cx);
             if let Some(inbox) = crate::live::inbox(&m.folders.read(cx).mailboxes) {
@@ -652,6 +987,79 @@ pub(crate) mod scenes {
         shown(m, postman_demo::channel::NEWS, cx)
     }
 
+    fn bot(_: &Scene, m: &mut Mailer, _: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        m.open_chat_scope(Scope::All(demo()), cx);
+        if !open(m, postman_demo::channel::GROUP, cx) {
+            return Err("no group in the demo channel".into());
+        }
+        Ok(())
+    }
+
+    fn bot_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        shown(m, postman_demo::channel::GROUP, cx) && m.chats.pane.read(cx).bot_reply_shown()
+    }
+
+    fn smart_folder(_: &Scene, m: &mut Mailer, _: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        m.open_chat_scope(Scope::Smart(Smart::Unread), cx);
+        Ok(())
+    }
+
+    /// В области чтения — беседа чата или письмо беседы почты.
+    fn reading(m: &Mailer, cx: &App) -> bool {
+        m.chats.pane.read(cx).ready() || (m.chats.mail_open && m.reading.read(cx).reading.is_some())
+    }
+
+    fn smart_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        m.chats.scope == Some(Scope::Smart(Smart::Unread)) && !m.chats.list.read(cx).is_empty() && reading(m, cx)
+    }
+
+    fn person(_: &Scene, m: &mut Mailer, _: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        // Имя — как у личной беседы демо-канала; адрес — её почта в демо-ящике.
+        let direct = address(postman_demo::channel::DIRECT);
+        let name = m.chats.snapshot.rows.iter().find(|r| *r.at() == direct).map(|r| r.item.summary.conversation.title.clone());
+        let Some(name) = name else { return Err("no direct conversation in the demo channel".into()) };
+        m.chat_person(Person { name, addresses: vec!["anna@example.test".into()] }, cx);
+        m.folders.update(cx, |f, cx| f.screen_scroll_top(cx));
+        Ok(())
+    }
+
+    fn person_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        let Some(Scope::Smart(Smart::Person(p))) = &m.chats.scope else { return false };
+        m.section == Section::Mail && m.chats.snapshot.people().contains(p) && !m.chats.list.read(cx).is_empty()
+    }
+
+    fn empty(_: &Scene, m: &mut Mailer, _: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        m.open_chat_scope(Scope::Smart(Smart::Pinned), cx);
+        Ok(())
+    }
+
+    fn empty_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        m.chats.scope == Some(Scope::Smart(Smart::Pinned)) && m.chats.pane.read(cx).address().is_none()
+    }
+
+    fn settings(_: &Scene, m: &mut Mailer, window: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        m.open_settings(Some(crate::settings_tab::Section::Channels), window, cx);
+        Ok(())
+    }
+
+    fn settings_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        crate::screens::settings_on(m, crate::settings_tab::Section::Channels, cx)
+    }
+
+    fn login(_: &Scene, m: &mut Mailer, window: &mut Window, cx: &mut Context<Mailer>) -> Result<(), String> {
+        crate::prefs::update(cx, |p| p.channels.telegram = true);
+        m.open_settings(Some(crate::settings_tab::Section::Channels), window, cx);
+        let Some(view) = m.settings.view.clone() else { return Err("settings are not open".into()) };
+        let panel = view.read(cx).channels.clone();
+        panel.update(cx, |p, cx| p.screen_code_step(window, cx));
+        Ok(())
+    }
+
+    fn login_ready(_: &Scene, m: &Mailer, cx: &App) -> bool {
+        let card = m.settings.view.as_ref().is_some_and(|v| v.read(cx).channels.read(cx).signing_in());
+        card && crate::screens::settings_on(m, crate::settings_tab::Section::Channels, cx)
+    }
+
     /// Сколько раз сцена ждала: раз в сотню шагов — строка в журнал, что ещё не готово (диагностика прогона снимков).
     static WAITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -680,6 +1088,19 @@ pub(crate) mod scenes {
                 // Один раз: дерево, которое помещается целиком, прокручивать некуда.
                 if open(m, postman_demo::channel::GROUP, cx) && !TREE_AT_END.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     m.folders.update(cx, |f, cx| f.screen_scroll_chats(cx));
+                }
+            }
+            "chat-bot" => {
+                let ready = shown(m, postman_demo::channel::GROUP, cx);
+                if ready && !m.chats.pane.read(cx).bot_reply_shown() {
+                    m.chats.pane.update(cx, |p, cx| p.screen_bot_reply(cx));
+                }
+            }
+            // Первая беседа умной папки — в область чтения.
+            "chat-smart" => {
+                let first = m.chats.list.read(cx).first();
+                if let Some(at) = first.filter(|_| !reading(m, cx) && m.chats.list.read(cx).selected.is_none()) {
+                    m.open_chat(at, cx);
                 }
             }
             "chat-direct" => {
@@ -739,7 +1160,7 @@ mod tests {
                 }]),
             ])
             .unwrap();
-        let s = snapshot(&cache, 100, &|_| true).unwrap();
+        let s = snapshot(&cache, 100, &|_| true, None).unwrap();
         let chan = store.chan();
         assert_eq!(s.accounts.len(), 1);
         assert_eq!(s.accounts[0].folders[0].name, "Работа");
@@ -750,8 +1171,62 @@ mod tests {
         assert_eq!(folder.len(), 1);
         assert_eq!(folder[0].at().conversation.0, "g");
         assert!(s.rows_of(&Scope::All(postman_core::channel::ChanAccount::new("telegram", "1"))).is_empty());
-        let off = snapshot(&cache, 100, &|_| false).unwrap();
+        let off = snapshot(&cache, 100, &|_| false, None).unwrap();
         assert!(off.accounts.is_empty() && off.rows.is_empty(), "канал выключен — его бесед на экране нет");
+    }
+
+    /// Умные папки: без каналов их нет; выключенной в настройках нет в снимке; папка человека — по его адресам;
+    /// настройки и люди переживают перечитывание базы.
+    #[test]
+    fn smart_folders_follow_settings() {
+        use postman_core::channel::{Member, Role};
+
+        use super::{Person, Smart, set_smart_people, set_smart_shown, smart_people, smart_shown};
+        let cache = Cache::open_in_memory().unwrap();
+        assert_eq!(smart_shown(&cache).unwrap(), [true; 3], "записи нет — показаны все");
+        assert!(snapshot(&cache, 100, &|_| true, None).unwrap().smart.is_empty(), "каналов нет — умных папок нет");
+        let (channel, account) = (ChannelId::new("demo"), AccountId::new("me@example.test"));
+        let store = ChannelStore::open(cache.clone(), &channel, &account, "Я").unwrap();
+        let conv = |id: &str, pinned| Conversation {
+            id: ConversationId::new(id),
+            kind: ConversationKind::Group,
+            title: id.into(),
+            pinned,
+            ..Conversation::default()
+        };
+        let anna =
+            Participant {
+                id: ParticipantId::new("u-anna"), name: "Анна".into(), emails: vec!["anna@example.test".into()], ..Participant::default()
+            };
+        store
+            .apply(vec![
+                ChannelEvent::Conversations(vec![conv("g", false), conv("p", true)]),
+                ChannelEvent::People(vec![anna]),
+                ChannelEvent::Members {
+                    conversation: ConversationId::new("g"),
+                    changed: vec![Member { id: ParticipantId::new("u-anna"), role: Role::Member }],
+                    left: vec![],
+                },
+                ChannelEvent::Messages {
+                    conversation: ConversationId::new("g"), messages: vec![message("1", "u-anna", 20, "привет")], live: false
+                },
+            ])
+            .unwrap();
+        let person = Person { name: "Анна".into(), addresses: vec!["anna@example.test".into()] };
+        set_smart_shown(&cache, [true, false, true]).unwrap();
+        set_smart_people(&cache, std::slice::from_ref(&person)).unwrap();
+        assert_eq!(smart_shown(&cache).unwrap(), [true, false, true]);
+        assert_eq!(smart_people(&cache).unwrap(), std::slice::from_ref(&person));
+        let s = snapshot(&cache, 100, &|_| true, None).unwrap();
+        let kinds: Vec<Smart> = s.smart.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(kinds, [Smart::Unread, Smart::Pinned, Smart::Person(person.clone())], "«Упоминания меня» выключены");
+        let ids = |smart: Smart| s.rows_of(&Scope::Smart(smart)).iter().map(|r| r.at().conversation.0.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(Smart::Unread), ["g"]);
+        assert_eq!(ids(Smart::Pinned), ["p"]);
+        assert_eq!(ids(Smart::Person(person.clone())), ["g"]);
+        assert!(ids(Smart::Mentions).is_empty());
+        assert_eq!(s.counts(&Scope::Smart(Smart::Unread)).unread, 1);
+        assert_eq!(s.people(), [person]);
     }
 
     /// «Нет у сервера — нет на экране»: правка, удаление у всех, реакции, ответ, поле ввода — по возможностям, сроку

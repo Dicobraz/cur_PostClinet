@@ -967,3 +967,6 @@ directory-timeout = The directory did not answer in 5 s.
 directory-unavailable = The directory is unavailable.
 settings-cal-subscriptions = Refresh subscriptions
 settings-cal-subscriptions-hint = How often to download calendars added by link.
+settings-nav-channels = Channels
+settings-nav-channels-keywords = channel conversation chat telegram matrix sign in qr smart folder policy
+settings-hint-channels = Telegram and Matrix conversations next to mail: channel accounts, sign-in and smart folders.

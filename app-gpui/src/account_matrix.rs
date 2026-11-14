@@ -462,7 +462,7 @@ impl Render for Panel {
                     link(("mx-sign-out", n), tr!("tg-sign-out"), &l)
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(PanelEvent::SignOut(a3.clone())))),
                 );
-            out = out.child(row(name, Some(state), actions, &l));
+            out = out.child(crate::settings_channels::account_row(line.state.as_ref(), name, state, actions, &l));
         }
         if self.flow.is_some() {
             out = out.child(div().pt_3().child(self.flow_card(&l, cx)));

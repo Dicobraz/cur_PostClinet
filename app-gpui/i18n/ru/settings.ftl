@@ -975,3 +975,6 @@ directory-timeout = Каталог не ответил за 5 с.
 directory-unavailable = Каталог недоступен.
 settings-cal-subscriptions = Обновлять подписки
 settings-cal-subscriptions-hint = Как часто скачивать календари по ссылке.
+settings-nav-channels = Каналы
+settings-nav-channels-keywords = канал беседа чат telegram телеграм matrix вход qr умная папка политика
+settings-hint-channels = Беседы Telegram и Matrix рядом с почтой: учётки каналов, вход и умные папки.

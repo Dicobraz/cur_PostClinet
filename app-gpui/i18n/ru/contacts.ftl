@@ -147,3 +147,4 @@ contacts-to-group-new = Новая группа…
 contacts-added-to-group = { $name } — в группе «{ $group }»
 contacts-already-in-group = { $name } уже в группе «{ $group }»
 contacts-removed-from-group = { $name } — больше не в группе «{ $group }»
+contacts-all-channels = Во всех каналах

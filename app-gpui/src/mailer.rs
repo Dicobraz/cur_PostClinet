@@ -286,6 +286,7 @@ impl Mailer {
                 }
                 FolderEvent::Toast(text) => this.toast(pets_ui::Level::Info, text.clone(), cx),
                 FolderEvent::Chat(scope) => this.open_chat_scope(scope.clone(), cx),
+                FolderEvent::ChatForget(person) => this.chat_person_forget(person, cx),
                 FolderEvent::Local(e) => this.local_folder_edit(e.clone(), cx),
                 FolderEvent::Letters(d, to) => this.letters_dropped(d, to.clone(), cx),
                 FolderEvent::Export(id) => {
@@ -1013,7 +1014,7 @@ impl Mailer {
             let picked = self.list.read(cx).selection.len() > 1;
             let reading = || {
                 match self.compose.inline_view() {
-                    _ if chat => card(l).flex_1().child(self.chats.pane.clone().cached(full())),
+                    _ if chat && !self.chats.mail_open => card(l).flex_1().child(self.chats.pane.clone().cached(full())),
                     _ if picked => card(l).flex_1().child(self.summary.clone().cached(full())),
                     Some(reply) => card(l)
                         .flex_1()
@@ -1040,7 +1041,7 @@ impl Mailer {
                         )
                         .child(reading()),
                 ),
-                Pane::Hidden if chat && self.chats.pane.read(cx).address().is_some() => body.child(reading()),
+                Pane::Hidden if chat && (self.chats.mail_open || self.chats.pane.read(cx).address().is_some()) => body.child(reading()),
                 Pane::Hidden if !chat && self.reading_instead_of_list(cx) => body.child(reading()),
                 Pane::Hidden => body.child(card(l).flex_1().child(list())),
             };

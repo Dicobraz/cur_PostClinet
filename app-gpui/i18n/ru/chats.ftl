@@ -83,3 +83,40 @@ chat-bar-pin = Закрепить
 chat-bar-mute = Заглушить
 chat-bar-read = Прочитано
 chat-bar-reply = Ответить
+chats-poll-line = Опрос: { $question }
+chats-poll-closed = Опрос закрыт
+chats-poll-votes = { $n ->
+    [one] { $n } голос
+    [few] { $n } голоса
+   *[many] { $n } голосов
+}
+chats-poll-vote = Проголосовать
+chats-poll-retract = Отозвать голос
+chats-ok = ОК
+chats-link-offered = Бот предлагает открыть ссылку
+chats-link-open = Открыть
+chats-demo-alert = Сборка перезапущена. Журнал — по ссылке.
+chats-smart = Умные папки
+chats-smart-hint = Беседы всех каналов и почты в одном списке. Что показывать в дереве папок:
+chats-smart-unread = Непрочитанное везде
+chats-smart-mentions = Упоминания меня
+chats-smart-pinned = Закреплённые
+chats-smart-forget = Убрать папку человека
+chats-person-no-channels = Каналы бесед не подключены: включите канал в «Настройки → Каналы».
+chats-policy = Политика организации
+chats-policy-set = задано организацией
+chats-policy-on = Включён, выключить нельзя
+chats-policy-off = Запрещён
+chats-none-title = Каналов бесед нет
+chats-none-text = В этой сборке каналов нет или они запрещены политикой организации.
+chats-empty-unread-title = Всё прочитано
+chats-empty-unread-text = Непрочитанных бесед нет ни в почте, ни в каналах.
+chats-empty-mentions-title = Упоминаний нет
+chats-empty-mentions-text = Беседы, где вас упомянули в непрочитанном, появятся здесь.
+chats-empty-pinned-title = Закреплённых бесед нет
+chats-empty-pinned-text = Закрепите беседу — она будет здесь и вверху своей папки.
+chats-empty-person-title = Бесед с этим человеком нет
+chats-empty-person-text = Ни в почте, ни в подключённых каналах бесед с ним не нашлось.
+chats-off-title = Каналы бесед выключены
+chats-off-text = Беседы Telegram и Matrix рядом с почтой: одна лента, общий поиск, умные папки.
+chats-turn-on = Включить

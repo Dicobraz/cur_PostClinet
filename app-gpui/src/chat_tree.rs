@@ -8,7 +8,7 @@ use pets_i18n::tr;
 use pets_ui::theme::Metric;
 use postman_core::channel::{ChanAccount, ChannelFolder, ChannelState, FolderRef};
 
-use crate::chats::{Account, Scope};
+use crate::chats::{Account, Scope, Smart};
 use crate::chrome::{glyph, icon};
 use crate::folders::{FolderEvent, Folders, chevron, row_h, strip, unread};
 use crate::icons;
@@ -40,6 +40,102 @@ pub(crate) fn folder_tree(folders: &[ChannelFolder]) -> Vec<(&ChannelFolder, usi
 }
 
 impl Folders {
+    /// Блок «Умные папки»: «Непрочитанное везде», «Упоминания меня», «Закреплённые» и папки людей — беседы всех
+    /// каналов и почты.
+    pub(crate) fn smart_rows(&self, l: &Look, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let snapshot = self.chats.clone();
+        if snapshot.smart.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = vec![
+            div()
+                .h(px(24.))
+                .flex_none()
+                .flex()
+                .items_end()
+                .pl(px(8.))
+                .pb(px(2.))
+                .text_size(px(12.))
+                .text_color(l.text2())
+                .child(tr!("chats-smart"))
+                .into_any_element(),
+        ];
+        for (n, (s, _)) in snapshot.smart.iter().enumerate() {
+            rows.push(self.smart_row(n, s, l, cx));
+        }
+        rows.push(div().h(px(1.)).mx(px(8.)).my(px(6.)).flex_none().bg(l.border()).into_any_element());
+        rows
+    }
+
+    fn smart_row(&self, n: usize, s: &Smart, l: &Look, cx: &mut Context<Self>) -> AnyElement {
+        let scope = Scope::Smart(s.clone());
+        let selected = self.results.is_none() && self.chat_scope.as_ref() == Some(&scope);
+        let counts = self.chats.counts(&scope);
+        let mark = match s {
+            Smart::Unread => icon(glyph::MAIL, 16.).into_any_element(),
+            Smart::Mentions => div().w(px(16.)).text_center().font_weight(FontWeight::SEMIBOLD).child("@").into_any_element(),
+            Smart::Pinned => icon(glyph::PIN, 16.).into_any_element(),
+            Smart::Person(_) => icon(glyph::CONTACTS, 16.).into_any_element(),
+        };
+        let group = SharedString::from(format!("smart-{n}"));
+        // Папку человека можно убрать: ✕ при наведении.
+        let forget = match s {
+            Smart::Person(p) => {
+                let p = p.clone();
+                Some(
+                    div()
+                        .id(("smart-forget", n))
+                        .flex_none()
+                        .size(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .text_color(l.text2())
+                        .invisible()
+                        .group_hover(group.clone(), |s| s.visible())
+                        .hover(|d| d.bg(l.hover()))
+                        .child(icon(glyph::CLOSE, 10.))
+                        .tooltip(|window, cx| crate::screens::tip(tr!("chats-smart-forget"), window, cx))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(FolderEvent::ChatForget(p.clone()));
+                        })),
+                )
+            }
+            _ => None,
+        };
+        // Счётчик — у непрочитанного и упоминаний; у закреплённых и людей он не про папку.
+        let count = match s {
+            Smart::Unread => counts.unread,
+            Smart::Mentions => counts.mentions,
+            _ => 0,
+        };
+        let id = SharedString::from(format!("chat-smart-{n}"));
+        div()
+            .id(id.clone())
+            .children(crate::screens::spot(id))
+            .group(group)
+            .h(px(row_h(l)))
+            .flex_none()
+            .pl(px(4.))
+            .pr(px(8.))
+            .rounded(l.px(Metric::RadiusControl))
+            .when(selected, |d| d.relative().bg(l.row_fill(self.focused)).child(strip(l.row_strip(self.focused))))
+            .when(!selected, |d| d.hover(|d| d.bg(l.row_hover())))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().w(px(12.)).flex_none())
+            .child(div().ml(px(-4.)).mr(px(2.)).child(mark))
+            .child(div().flex_1().min_w_0().truncate().child(s.title()))
+            .children(forget)
+            .when(count > 0, |d| unread(d, count, l))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(FolderEvent::Chat(scope.clone()))))
+            .into_any_element()
+    }
+
     /// Разделы учёток каналов — после почтовых.
     pub(crate) fn chat_rows(&self, l: &Look, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let snapshot = self.chats.clone();
@@ -67,7 +163,7 @@ impl Folders {
         let channel = crate::tape::channel_name(&a.chan.channel.0);
         let label = if with_name && !a.name.is_empty() { format!("{channel} · {}", a.name) } else { channel };
         let total = if open { 0 } else { self.chats.counts(&Scope::All(a.chan.clone())).unread };
-        let selected = !open && self.chat_scope.as_ref().is_some_and(|s| *s.account() == a.chan);
+        let selected = !open && self.chat_scope.as_ref().is_some_and(|s| s.account() == Some(&a.chan));
         // Нет связи с каналом — метка, как у почтовой учётки.
         let lines = cx.try_global::<crate::account_telegram::Lines>();
         let state = lines.and_then(|g| g.0.iter().find(|x| x.account == a.chan)).and_then(|x| x.state.clone());
@@ -125,6 +221,7 @@ impl Folders {
         let id = SharedString::from(match &scope {
             Scope::All(a) => format!("chat-all-{a}"),
             Scope::Folder(a, f) => format!("chat-folder-{a}-{f}"),
+            Scope::Smart(_) => String::from("chat-smart"),
         });
         let mark = if folder {
             icons::icon(icons::FOLDER, 20., l.text()).ml(px(-6.)).into_any_element()

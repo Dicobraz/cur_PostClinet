@@ -723,6 +723,8 @@ impl Mailer {
             self.reload_folders(cx);
         }
         if plan.list {
+            // Беседы почты в умных папках (CH-04).
+            self.chats_mail_changed(cx);
             self.live.synced = true;
             self.list.update(cx, |l, cx| l.refresh(cx));
             self.check_new_mail(cx);

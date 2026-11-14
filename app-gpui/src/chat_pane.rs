@@ -61,6 +61,8 @@ pub(crate) enum PaneEvent {
     Pin(Address, bool),
     /// Текст — в буфер обмена.
     Copy(String),
+    /// Действие довеска (кнопка бота, голос): ответ канала вернётся в [`ChatPane::extra_reply`].
+    Extra(ChanAccount, Action),
 }
 
 impl EventEmitter<PaneEvent> for ChatPane {}
@@ -285,6 +287,12 @@ pub(crate) struct ChatPane {
     deleting: Option<(MessageId, bool)>,
     /// Эмодзи над полем ввода.
     emoji: bool,
+    /// Выбор в опросе с несколькими ответами, пока не нажато «Проголосовать»: сообщение и номера вариантов.
+    picks: Option<(MessageId, Vec<usize>)>,
+    /// Ответ бота предупреждением — строкой над полем ввода, до «ОК».
+    alert: Option<String>,
+    /// Ссылка, которую предложил канал: показана строкой, открывает её только нажатие.
+    offered: Option<String>,
     scroll: ScrollHandle,
     to_bottom: bool,
     /// Текст поля при следующей отрисовке: очистить или подставить (правка, эмодзи).
@@ -308,6 +316,9 @@ impl ChatPane {
             more: None,
             deleting: None,
             emoji: false,
+            picks: None,
+            alert: None,
+            offered: None,
             scroll: ScrollHandle::new(),
             to_bottom: false,
             clear_text: false,
@@ -362,6 +373,9 @@ impl ChatPane {
         self.more = None;
         self.deleting = None;
         self.emoji = false;
+        self.picks = None;
+        self.alert = None;
+        self.offered = None;
         self.typing.clear();
         self.typing_sent = None;
     }
@@ -471,7 +485,9 @@ impl ChatPane {
 
     /// Esc: строка удаления, выбор реакции и «ещё», эмодзи, затем ответ и правка.
     pub(crate) fn escape(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = self.deleting.take().is_some() || self.reacting.take().is_some() || self.more.take().is_some() || std::mem::take(&mut self.emoji);
+        let had = self.alert.take().is_some() || self.offered.take().is_some();
+        let had =
+            had || self.deleting.take().is_some() || self.reacting.take().is_some() || self.more.take().is_some() || std::mem::take(&mut self.emoji);
         let had = had || self.cancel_draft();
         if had {
             cx.notify();
@@ -1045,6 +1061,7 @@ impl ChatPane {
             .children(quotes)
             .child(self.body(n, m, mentioned, d, l, cx))
             .children(self.attachments(m, l))
+            .children(self.extra(n, m, pending.is_none(), d, l, cx))
             .children(self.reactions(n, m, s.react, l, cx))
             .when(self.reacting.as_ref() == Some(&m.id) && s.react, |c| c.child(self.reaction_picker(n, m, d, l, cx)))
             .when(self.more.as_ref() == Some(&m.id), |c| c.child(self.more_strip(n, m, s, l, cx)));
@@ -1195,6 +1212,219 @@ impl ChatPane {
         )
     }
 
+    /// Ответ канала на действие довеска (ADR 0012): текст — подсказкой (тост) или предупреждением (строка с «ОК»),
+    /// ссылка — показать; открыть её — только нажатием.
+    pub(crate) fn extra_reply(&mut self, reply: postman_core::channel::ExtraReply, cx: &mut Context<Self>) {
+        match reply.text.filter(|t| !t.trim().is_empty()) {
+            Some(text) if reply.alert => self.alert = Some(text),
+            Some(text) => cx.emit(PaneEvent::Toast(Toast::Info, text)),
+            None => {}
+        }
+        if let Some(url) = reply.url.filter(|u| !u.trim().is_empty()) {
+            self.offered = Some(url);
+        }
+        cx.notify();
+    }
+
+    fn press(&mut self, message: MessageId, payload: postman_core::channel::Extra, cx: &mut Context<Self>) {
+        if let Some(o) = &self.open {
+            let action = Action::Extra { conversation: o.at.conversation.clone(), message, payload };
+            cx.emit(PaneEvent::Extra(o.at.chan(), action));
+        }
+    }
+
+    /// Голос в опросе: `picks` — номера вариантов, пусто — отозвать.
+    fn vote(&mut self, m: &Message, picks: &[usize], cx: &mut Context<Self>) {
+        let Some(channel) = self.address().map(|at| at.channel.0.clone()) else { return };
+        if let Some(payload) = crate::chat_extra::vote(&channel, &m.extra, picks) {
+            self.picks = None;
+            self.press(m.id.clone(), payload, cx);
+            cx.notify();
+        }
+    }
+
+    /// Довесок сообщения (кнопки бота, опрос): нажать можно только при `ChannelFeatures::extra`.
+    fn extra(&self, n: usize, m: &Message, sent: bool, d: &Loaded, l: &Look, cx: &mut Context<Self>) -> Option<Div> {
+        let v = crate::chat_extra::view(&d.summary.address.channel.0, &m.extra)?;
+        let can = d.features.extra && sent;
+        let mut col = div().flex().flex_col().gap(px(6.)).pt_1().min_w(px(260.));
+        if let Some(p) = &v.poll {
+            col = col.child(self.poll(n, m, p, can, l, cx));
+        }
+        for (r, row) in v.rows.iter().enumerate() {
+            col = col.child(div().flex().gap(px(6.)).children(row.iter().enumerate().map(|(k, b)| {
+                let (id, payload) = (m.id.clone(), b.payload.clone());
+                crate::buttons::secondary(SharedString::from(format!("chat-bot-{n}-{r}-{k}")), l)
+                    .flex_1()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .justify_center()
+                    .text_size(px(12.))
+                    .when(b.link, |d| d.child(icon(glyph::LINK, 11.)))
+                    .child(div().truncate().child(b.text.clone()))
+                    .when(can, |d| d.on_click(cx.listener(move |this, _, _, cx| this.press(id.clone(), payload.clone(), cx))))
+                    .when(!can, |d| d.opacity(0.6).cursor_default())
+            })));
+        }
+        Some(col)
+    }
+
+    /// Опрос: вопрос, варианты с долей голосов и моим выбором; один ответ — голос щелчком, несколько — отметить и
+    /// «Проголосовать»; «Отозвать голос» — пока опрос открыт.
+    fn poll(&self, n: usize, m: &Message, p: &crate::chat_extra::Poll, can: bool, l: &Look, cx: &mut Context<Self>) -> Div {
+        let open = can && !p.closed;
+        let total = p.total();
+        let voted = p.voted();
+        let picks: Vec<usize> = self.picks.as_ref().filter(|(id, _)| *id == m.id).map(|(_, v)| v.clone()).unwrap_or_default();
+        let mut col = div().flex().flex_col().gap(px(4.)).child(div().font_weight(FontWeight::SEMIBOLD).child(p.question.clone()));
+        for (i, c) in p.choices.iter().enumerate() {
+            let on = c.chosen || picks.contains(&i);
+            let share = match (c.votes, total) {
+                (Some(v), t) if t > 0 => v as f32 / t as f32,
+                _ => 0.,
+            };
+            let mark = if p.multiple { crate::list::checkbox(on, l).size(px(16.)) } else { crate::settings_tab::radio(on, l) };
+            let message = m.clone();
+            let (multiple, chosen) = (p.multiple, c.chosen);
+            let row = div()
+                .id(SharedString::from(format!("chat-poll-{n}-{i}")))
+                .children(crate::screens::spot(SharedString::from(format!("chat-poll-{n}-{i}"))))
+                .relative()
+                .h(px(30.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(l.px(Metric::RadiusControl))
+                .border_1()
+                .border_color(if on { l.accent() } else { l.border() })
+                .overflow_hidden()
+                // Доля голосов — заливкой от левого края.
+                .child(div().absolute().left_0().top_0().bottom_0().w(relative(share)).bg(l.pm(Pm::Secondary)))
+                .child(div().relative().child(mark))
+                .child(div().relative().flex_1().min_w_0().truncate().child(c.text.clone()))
+                .children(c.votes.map(|v| div().relative().flex_none().text_size(px(12.)).text_color(l.text2()).child(v.to_string())))
+                .when(open, |d| {
+                    d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        if multiple {
+                            let mut list = this.picks.take().filter(|(id, _)| *id == message.id).map(|(_, v)| v).unwrap_or_default();
+                            match list.iter().position(|x| *x == i) {
+                                Some(at) => {
+                                    list.remove(at);
+                                }
+                                None => list.push(i),
+                            }
+                            this.picks = Some((message.id.clone(), list));
+                            cx.notify();
+                        } else if chosen {
+                            this.vote(&message, &[], cx);
+                        } else {
+                            this.vote(&message, &[i], cx);
+                        }
+                    }))
+                });
+            col = col.child(row);
+        }
+        let mut foot = div().flex().items_center().gap(px(10.)).text_size(px(12.)).text_color(l.text2());
+        foot = foot.child(if p.closed { tr!("chats-poll-closed") } else { tr!("chats-poll-votes", n = i64::from(total)) });
+        if open && p.multiple && !picks.is_empty() {
+            let message = m.clone();
+            foot = foot.child(
+                crate::buttons::primary(("chat-poll-vote", n), l)
+                    .h(px(24.))
+                    .px(px(10.))
+                    .child(tr!("chats-poll-vote"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.vote(&message, &picks, cx))),
+            );
+        }
+        if open && voted {
+            let message = m.clone();
+            foot = foot.child(
+                div()
+                    .id(("chat-poll-retract", n))
+                    .cursor_pointer()
+                    .text_color(l.accent_text())
+                    .child(tr!("chats-poll-retract"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.vote(&message, &[], cx))),
+            );
+        }
+        col.child(foot)
+    }
+
+    /// Строки ответа канала над полем ввода: предупреждение бота с «ОК» и предложенная ссылка с «Открыть».
+    fn reply_lines(&self, l: &Look, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let line = |id: &'static str, l: &Look| {
+            div()
+                .id(id)
+                .children(crate::screens::spot(id))
+                .flex_none()
+                .mx(px(24.))
+                .mb(px(4.))
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(l.px(Metric::RadiusControl))
+        };
+        let mut out = Vec::new();
+        if let Some(text) = &self.alert {
+            out.push(
+                line("chat-bot-alert", l)
+                    .bg(l.warning_bg())
+                    .child(icon(glyph::WARNING, 14.).text_color(l.warning()))
+                    .child(div().flex_1().min_w_0().child(text.clone()))
+                    .child(crate::buttons::button("chat-bot-alert-ok", tr!("chats-ok"), true, l).on_click(cx.listener(|this, _, _, cx| {
+                        this.alert = None;
+                        cx.notify();
+                    }))),
+            );
+        }
+        if let Some(url) = &self.offered {
+            let href = url.clone();
+            out.push(
+                line("chat-bot-link", l)
+                    .bg(l.fill())
+                    .child(icon(glyph::LINK, 14.).text_color(l.text2()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(12.)).text_color(l.text2()).child(tr!("chats-link-offered")))
+                            .child(div().truncate().child(url.clone())),
+                    )
+                    .child(crate::buttons::button("chat-bot-link-open", tr!("chats-link-open"), true, l).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.offered = None;
+                            ir_view::open_link(&href, false, &href, cx);
+                            cx.notify();
+                        },
+                    )))
+                    .child(crate::buttons::button("chat-bot-link-close", tr!("chats-cancel"), false, l).on_click(cx.listener(|this, _, _, cx| {
+                        this.offered = None;
+                        cx.notify();
+                    }))),
+            );
+        }
+        out
+    }
+
+    /// Сцена снимков: ответ бота предупреждением и ссылкой — как после нажатия кнопки.
+    pub(crate) fn screen_bot_reply(&mut self, cx: &mut Context<Self>) {
+        self.extra_reply(
+            postman_core::channel::ExtraReply {
+                text: Some(tr!("chats-demo-alert")),
+                alert: true,
+                url: Some(postman_demo::channel::BUILD_LOG.into()),
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn bot_reply_shown(&self) -> bool {
+        self.alert.is_some() && self.offered.is_some()
+    }
+
     /// «Удалить сообщение?» — строкой над полем ввода (без модальных окон).
     fn delete_line(&self, l: &Look, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let (_, for_all) = self.deleting.as_ref()?;
@@ -1288,6 +1518,7 @@ impl Render for ChatPane {
             )
             .children(self.typing_line(d, &l))
             .children(self.delete_line(&l, cx))
+            .children(self.reply_lines(&l, cx))
             .children(self.composer(d, s, window, &l, cx))
             .into_any_element()
     }

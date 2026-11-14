@@ -24,6 +24,8 @@ use crate::roles::Look;
 pub(crate) enum Section {
     General,
     Accounts,
+    /// «Каналы» (CH-04): учётки каналов бесед, политика, умные папки.
+    Channels,
     Categories,
     Quick,
     Reading,
@@ -52,9 +54,10 @@ impl Section {
         }
     }
 
-    pub(crate) const ALL: [Section; 13] = [
+    pub(crate) const ALL: [Section; 14] = [
         Section::General,
         Section::Accounts,
+        Section::Channels,
         Section::Reading,
         Section::Viewers,
         Section::Calendar,
@@ -72,6 +75,7 @@ impl Section {
         match self {
             Section::General => "general",
             Section::Accounts => "accounts",
+            Section::Channels => "channels",
             Section::Categories => "categories",
             Section::Quick => "quick",
             Section::Reading => "reading",
@@ -102,6 +106,7 @@ impl Section {
         match self {
             Section::General => '\u{E771}',
             Section::Accounts => '\u{E77B}',
+            Section::Channels => glyph::CONVERSATION,
             Section::Categories => '\u{E8EC}',
             Section::Quick => '\u{E8FD}',
             Section::Reading => '\u{E8A1}',
@@ -189,6 +194,8 @@ pub(crate) enum SettingsEvent {
     Telegram(crate::account_telegram::PanelEvent),
     /// Matrix (CH-05): вход, «Выйти», проверка устройства, ключи, «Шифрованные беседы».
     Matrix(crate::account_matrix::PanelEvent),
+    /// «Каналы» (CH-04): показывать ли умную папку номер … в дереве.
+    Smart(usize, bool),
 }
 
 pub(crate) struct SettingsView {
@@ -1108,6 +1115,7 @@ impl SettingsView {
             Section::Keys => self.keyboard(l, cx),
             Section::Signatures => self.signatures(l, window, cx),
             Section::Accounts => self.accounts(l, cx),
+            Section::Channels => self.channels_page(l, cx),
             Section::Rules | Section::Vacation => {
                 let panel = if self.section == Section::Rules { self.rules.clone() } else { self.vacation.clone() };
                 let body = match panel {

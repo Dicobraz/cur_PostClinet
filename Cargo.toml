@@ -103,6 +103,79 @@ opt-level = "s"
 [profile.release.package.wasmparser]
 opt-level = "s"
 
+# Канал Matrix (CH-05, docs/SIZE.md №12): `matrix-sdk`, `ruma*`, `vodozemac` и зависимости, которые тянет только
+# Matrix, — холодный код канала, по размеру (`"z"`: −1,1 МиБ к `"s"`). Только точные имена (cargo без `*`); общие с остальным exe
+# крейты (`sha2`, `rand`, `digest`…) не трогаем. Без `matrix-release` код канала в exe не попадает — на размер не влияет.
+[profile.release.package]
+anymap2 = { opt-level = "z" }
+archery = { opt-level = "z" }
+as_variant = { opt-level = "z" }
+assign = { opt-level = "z" }
+async-compression = { opt-level = "z" }
+async-stream = { opt-level = "z" }
+backon = { opt-level = "z" }
+blake3 = { opt-level = "z" }
+bs58 = { opt-level = "z" }
+bytesize = { opt-level = "z" }
+chacha20 = { opt-level = "z" }
+chacha20poly1305 = { opt-level = "z" }
+compression-codecs = { opt-level = "z" }
+compression-core = { opt-level = "z" }
+const_panic = { opt-level = "z" }
+curve25519-dalek = { opt-level = "z" }
+date_header = { opt-level = "z" }
+decancer = { opt-level = "z" }
+ed25519 = { opt-level = "z" }
+ed25519-dalek = { opt-level = "z" }
+eyeball = { opt-level = "z" }
+eyeball-im = { opt-level = "z" }
+generic-array = { opt-level = "z" }
+growable-bloom-filter = { opt-level = "z" }
+hex = { opt-level = "z" }
+hpke = { opt-level = "z" }
+imbl = { opt-level = "z" }
+imbl-sized-chunks = { opt-level = "z" }
+js_int = { opt-level = "z" }
+js_option = { opt-level = "z" }
+konst = { opt-level = "z" }
+language-tags = { opt-level = "z" }
+maplit = { opt-level = "z" }
+matrix-pickle = { opt-level = "z" }
+matrix-sdk = { opt-level = "z" }
+matrix-sdk-base = { opt-level = "z" }
+matrix-sdk-common = { opt-level = "z" }
+matrix-sdk-crypto = { opt-level = "z" }
+matrix-sdk-store-encryption = { opt-level = "z" }
+mime2ext = { opt-level = "z" }
+oauth2 = { opt-level = "z" }
+oauth2-reqwest = { opt-level = "z" }
+poly1305 = { opt-level = "z" }
+postman-backend-matrix = { opt-level = "z" }
+prost = { opt-level = "z" }
+rand_xoshiro = { opt-level = "z" }
+readlock = { opt-level = "z" }
+readlock-tokio = { opt-level = "z" }
+rmp = { opt-level = "z" }
+rmp-serde = { opt-level = "z" }
+ruma = { opt-level = "z" }
+ruma-client-api = { opt-level = "z" }
+ruma-common = { opt-level = "z" }
+ruma-events = { opt-level = "z" }
+ruma-identifiers-validation = { opt-level = "z" }
+safe_arch = { opt-level = "z" }
+serde_bytes = { opt-level = "z" }
+serde_html_form = { opt-level = "z" }
+serde_path_to_error = { opt-level = "z" }
+serdect = { opt-level = "z" }
+typewit = { opt-level = "z" }
+ulid = { opt-level = "z" }
+unicode-normalization = { opt-level = "z" }
+vodozemac = { opt-level = "z" }
+wide = { opt-level = "z" }
+wildmatch = { opt-level = "z" }
+x25519-dalek = { opt-level = "z" }
+xxhash-rust = { opt-level = "z" }
+
 # «Не падать» (S2-03): вне тестов нет unwrap/expect/panic!; в тестах разрешены (clippy.toml).
 [workspace.lints.clippy]
 unwrap_used = "deny"

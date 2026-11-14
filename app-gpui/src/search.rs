@@ -623,6 +623,10 @@ fn handlers(root: Div, cx: &mut Context<crate::Mailer>) -> Div {
         if this.section == crate::Section::Mail && this.reading.update(cx, |r, cx| r.close_preview(cx)) {
             return;
         }
+        // …затем режим «Медиа беседы» — назад к «Беседе» (MED-02).
+        if this.section == crate::Section::Mail && this.media_escape(cx) {
+            return;
+        }
         // …затем ответ, правку и строки подтверждения в беседе канала (CH-04).
         if this.section == crate::Section::Mail && this.chat_escape(cx) {
             return;

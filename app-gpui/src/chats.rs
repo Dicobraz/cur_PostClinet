@@ -433,6 +433,8 @@ pub(crate) struct Chats {
     pub(crate) scope: Option<Scope>,
     pub(crate) list: Entity<ChatList>,
     pub(crate) pane: Entity<ChatPane>,
+    /// «Медиа беседы» открытой беседы канала (MED-02).
+    pub(crate) media: Entity<crate::thread_media::MediaView>,
     /// Снимок читается; `again` — за это время база изменилась, прочитать ещё раз.
     loading: bool,
     again: bool,
@@ -440,22 +442,40 @@ pub(crate) struct Chats {
     ticket: u64,
     /// Запросы действий довеска (кнопка бота, голос): их ответ — ленте.
     extra: Vec<u64>,
+    /// Запросы выгрузки файлов из поля ввода: их итог — ленте.
+    uploads: Vec<u64>,
     /// В умной папке открыта беседа почты: в области чтения — письмо, кнопки — письма.
     pub(crate) mail_open: bool,
 }
 
 impl Chats {
-    pub(crate) fn new(cache: Cache, cx: &mut Context<Mailer>) -> (Self, Vec<Subscription>) {
+    pub(crate) fn new(cache: Cache, worker: Arc<std::sync::Mutex<postman_worker::Client>>, cx: &mut Context<Mailer>) -> (Self, Vec<Subscription>) {
         let list = cx.new(|_| ChatList::new());
-        let pane = cx.new(|_| ChatPane::new(cache));
+        let media = cx.new(|_| crate::thread_media::MediaView::new(cache.clone(), worker));
+        let pane = cx.new(|_| ChatPane::new(cache, media.clone()));
         let subs = vec![
+            cx.subscribe(&media, |this: &mut Mailer, _, ev: &crate::thread_media::MediaEvent, cx| this.on_media(ev, cx)),
+            // Режим и счётчик «Медиа беседы» сменились — лента чата перерисовывает вкладки под шапкой.
+            cx.observe(&media, |this: &mut Mailer, _, cx| this.chats.pane.update(cx, |_, cx| cx.notify())),
             cx.subscribe(&list, |this: &mut Mailer, _, ev: &ListEvent, cx| match ev {
                 ListEvent::Open(at) => this.open_chat(at.clone(), cx),
             }),
             cx.subscribe(&pane, |this: &mut Mailer, _, ev: &PaneEvent, cx| this.on_chat_pane(ev, cx)),
         ];
         (
-            Self { snapshot: Arc::default(), scope: None, list, pane, loading: false, again: false, ticket: 0, extra: Vec::new(), mail_open: false },
+            Self {
+                snapshot: Arc::default(),
+                scope: None,
+                list,
+                pane,
+                media,
+                loading: false,
+                again: false,
+                ticket: 0,
+                extra: Vec::new(),
+                uploads: Vec::new(),
+                mail_open: false,
+            },
             subs,
         )
     }
@@ -699,10 +719,12 @@ impl Mailer {
     }
 
     /// Запрос учётке канала; потока нет (канал выключен, нет связи с потоком) — тост.
-    pub(crate) fn chat_request(&mut self, account: ChanAccount, request: Request, cx: &mut Context<Self>) {
-        if !self.send_channel(Command::Channel { account, request: Box::new(request) }) {
+    pub(crate) fn chat_request(&mut self, account: ChanAccount, request: Request, cx: &mut Context<Self>) -> bool {
+        let sent = self.send_channel(Command::Channel { account, request: Box::new(request) });
+        if !sent {
             self.toast(Toast::Warning, tr!("chats-err-not-running"), cx);
         }
+        sent
     }
 
     fn chat_act(&mut self, account: ChanAccount, action: Action, cx: &mut Context<Self>) -> u64 {
@@ -714,7 +736,18 @@ impl Mailer {
 
     fn on_chat_pane(&mut self, ev: &PaneEvent, cx: &mut Context<Self>) {
         match ev {
-            PaneEvent::Request(account, request) => self.chat_request(account.clone(), request.clone(), cx),
+            PaneEvent::Request(account, request) => {
+                self.chat_request(account.clone(), request.clone(), cx);
+            }
+            PaneEvent::Upload(account, meta, bytes) => {
+                self.chats.ticket += 1;
+                let ticket = self.chats.ticket;
+                if self.chat_request(account.clone(), Request::Upload { ticket, meta: meta.clone(), bytes: bytes.clone() }, cx) {
+                    self.chats.uploads.push(ticket);
+                } else {
+                    self.chats.pane.update(cx, |p, cx| p.uploaded(Err(ChannelError::Network(String::new())), cx));
+                }
+            }
             PaneEvent::Act(account, action) => {
                 self.chat_act(account.clone(), action.clone(), cx);
             }
@@ -796,6 +829,13 @@ impl Mailer {
             Update::SendFailed { error, .. } => {
                 self.toast(Toast::Error, tr!("chats-send-failed", why = error_text(error)), cx);
                 self.chats.pane.update(cx, |p, cx| p.reload(cx));
+            }
+            Update::Uploaded { ticket, result } => {
+                if let Some(i) = self.chats.uploads.iter().position(|t| t == ticket) {
+                    self.chats.uploads.swap_remove(i);
+                    let result = result.clone();
+                    self.chats.pane.update(cx, |p, cx| p.uploaded(result, cx));
+                }
             }
             Update::Acted { ticket, result } => {
                 let extra = self.chats.extra.iter().position(|t| t == ticket).map(|i| self.chats.extra.swap_remove(i)).is_some();

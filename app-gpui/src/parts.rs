@@ -7,6 +7,7 @@ use crate::part::Part;
 pub(crate) const PARTS: &[Part] = &[
     crate::actions::PART,
     crate::thread::PART,
+    crate::thread_media::PART,
     crate::attachments::PART,
     crate::remote_images::PART,
     crate::sections::PART,

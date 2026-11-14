@@ -166,6 +166,8 @@ pub(crate) fn answer_queued_text(status: Partstat, answer: &postman_core::invite
 
 pub(crate) struct ReadingPane {
     pub(crate) worker: Arc<Mutex<Worker>>,
+    /// «Медиа беседы» открытой беседы (MED-02): режим вместо ленты и письма.
+    pub(crate) media: Option<Entity<crate::thread_media::MediaView>>,
     pub(crate) cache: Cache,
     pub(crate) reading: Option<Reading>,
     /// Ящик на сервере (ставит S3-04 при входе): байты вложений — из хранилища или командой `Blob`,
@@ -319,9 +321,39 @@ impl SyncRequest {
 impl EventEmitter<ReadingEvent> for ReadingPane {}
 
 impl ReadingPane {
+    /// «Медиа беседы» — беседе открытого письма (MED-02); письмо закрыто — режима нет.
+    pub(crate) fn sync_media(&mut self, cx: &mut Context<Self>) {
+        let Some(media) = &self.media else { return };
+        let source = self.reading.as_ref().map(|r| crate::thread_media::Source::Mail { thread: r.row.thread_id.clone(), me: self.me.clone() });
+        media.update(cx, |m, cx| m.set_source(source, cx));
+    }
+
+    /// Вкладки-режимы «Беседа · N писем | Медиа беседы · M» и строка-сводка над лентой.
+    fn media_head(&self, l: &crate::roles::Look, cx: &App) -> Option<Div> {
+        let media = self.media.as_ref()?;
+        let n = self.feed.as_ref().map_or(1, |f| f.conv.len());
+        let talk = tr!("media-mode-talk-mail", n = n as i64);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(crate::thread_media::mode_tabs(media, talk, l, cx))
+                .children(crate::thread_media::summary(media, l, cx)),
+        )
+    }
+
+    /// Режим «Медиа беседы» включён: его вид.
+    fn media_view(&self, cx: &App) -> Option<Entity<crate::thread_media::MediaView>> {
+        self.media.clone().filter(|m| m.read(cx).on)
+    }
+}
+
+impl ReadingPane {
     pub(crate) fn new(cache: Cache) -> Self {
         Self {
             worker: Arc::new(Mutex::new(Worker::new(Worker::default_exe(), WORKER_TIMEOUT))),
+            media: None,
             cache,
             reading: None,
             live: false,
@@ -534,6 +566,10 @@ impl ReadingPane {
 
     /// Событие синхронизации: блоб вложения, ответ на приглашение, мой адрес.
     pub(crate) fn on_sync(&mut self, ev: &Event, cx: &mut Context<Self>) {
+        // Тело письма пришло: «Медиа беседы» открытой беседы — собрать заново (MED-02).
+        if let (Event::BodyReady(_), Some(media)) = (ev, &self.media) {
+            media.update(cx, |m, cx| m.reload(cx));
+        }
         match ev {
             Event::BlobReady { blob_id, data } => self.blob_ready(blob_id, data.clone(), cx),
             Event::BlobFailed { blob_id, error } => self.blob_failed(blob_id, error.clone(), cx),
@@ -629,6 +665,7 @@ impl ReadingPane {
     pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
         self.replace(None);
         self.feed = None;
+        self.sync_media(cx);
         cx.notify();
     }
 
@@ -1209,7 +1246,22 @@ impl Render for ReadingPane {
                 .children(threat_strip(&r.row, &l))
                 .children(crate::shared::strip(&r.row, &l, cx))
                 .child(crate::lifecycle::header_row(&r.row, &l, cx))
-                .children(self.stack_info(cx));
+                .children(self.stack_info(cx))
+                .children(self.media_head(&l, cx));
+            // «Медиа беседы» — вместо писем стопки (MED-02).
+            if let Some(view) = self.media_view(cx) {
+                return div()
+                    .id("reading")
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .px(px(24.))
+                    .py(px(20.))
+                    .gap(px(4.))
+                    .child(top)
+                    .child(div().flex_1().min_h_0().child(view))
+                    .into_any_element();
+            }
             return div()
                 .id("reading")
                 .flex()
@@ -1345,6 +1397,26 @@ impl Render for ReadingPane {
         let bar = match self.view(cx) {
             postman_core::prefs::Conversation::Outlook => self.outlook_bar(cx),
             _ => self.feed_bar(cx),
+        };
+        // Режимы «Беседа | Медиа беседы» под шапкой (MED-02): в режиме медиа — вид вместо ленты и письма.
+        let mode = self.media_head(&l, cx);
+        if let Some(view) = self.media_view(cx) {
+            return div()
+                .id("reading")
+                .flex()
+                .flex_col()
+                .size_full()
+                .px(px(24.))
+                .py(px(20.))
+                .gap(px(12.))
+                .child(header)
+                .children(mode)
+                .child(div().flex_1().min_h_0().child(view))
+                .into_any_element();
+        }
+        let bar = match mode {
+            Some(mode) => Some(div().flex().flex_col().gap(px(8.)).child(mode).children(bar).into_any_element()),
+            None => bar,
         };
         // Приглашение боковой панелью справа (S5-24, «Настройки → Чтение»): над письмом — строка, панель — рядом.
         let side = r.invite.as_ref().and_then(|c| invite_card::render_side(c, self.me.as_deref(), cx));

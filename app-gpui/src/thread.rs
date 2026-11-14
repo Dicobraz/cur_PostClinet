@@ -101,6 +101,7 @@ impl ReadingPane {
 
     /// Открыто письмо: беседа — из кэша (в фоне). Та же беседа — лента остаётся, меняется текущее письмо.
     pub(crate) fn sync_thread(&mut self, cx: &mut Context<Self>) {
+        self.sync_media(cx);
         let Some(r) = &self.reading else { return };
         let key = r.row.thread_id.clone();
         if let Some(f) = self.feed.as_mut().filter(|f| f.conv.thread == key) {

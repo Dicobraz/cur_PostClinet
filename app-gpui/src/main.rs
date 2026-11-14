@@ -119,6 +119,7 @@ mod tabs;
 mod tape;
 mod tasks;
 mod thread;
+mod thread_media;
 mod tray;
 mod update;
 mod vacation;

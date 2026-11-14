@@ -120,3 +120,14 @@ chats-empty-person-text = Ни в почте, ни в подключённых �
 chats-off-title = Каналы бесед выключены
 chats-off-text = Беседы Telegram и Matrix рядом с почтой: одна лента, общий поиск, умные папки.
 chats-turn-on = Включить
+chats-attach = Вложить файл
+chats-file-remove = Убрать вложение
+chats-uploading = { $n ->
+    [one] Выгружается { $n } файл…
+    [few] Выгружаются { $n } файла…
+   *[many] Выгружаются { $n } файлов…
+}
+chats-wait-upload = Файлы ещё выгружаются — отправьте, когда закончится.
+chats-file-too-large = Файл «{ $name }» больше, чем принимает канал.
+chats-file-unread = Файл «{ $name }» не прочитан.
+chats-upload-failed = Файл не выгружен. { $why }

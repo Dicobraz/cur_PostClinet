@@ -92,6 +92,8 @@ pub(crate) struct Mailer {
     pub(crate) channels: crate::channels::Channels,
     /// Беседы каналов на экране (CH-04, `chats.rs`): снимок, что открыто, список и лента.
     pub(crate) chats: crate::chats::Chats,
+    /// «Медиа беседы» беседы открытого письма (MED-02, `thread_media.rs`).
+    pub(crate) media: Entity<crate::thread_media::MediaView>,
     /// Живой ящик: статус синхронизации, строка входа, поиск на сервере (`live.rs`).
     pub(crate) live: crate::live::Live,
     /// Уведомления о новых письмах (T2-10).
@@ -225,7 +227,14 @@ impl Mailer {
         // «Ждём» в почте — ещё и письма моих невыполненных поручений (S6-11); дальше — `TasksAction::Waiting`.
         let waiting = tasks.read(cx).waiting_keywords();
         list.update(cx, |l, cx| l.set_waiting(waiting, cx));
-        let (chats, chat_subs) = crate::chats::Chats::new(cache.clone(), cx);
+        // «Медиа беседы» (MED-02): у письма и у беседы канала — свой режим, воркер — общий с областью чтения.
+        let media_worker = reading.read(cx).worker.clone();
+        let media = cx.new(|_| crate::thread_media::MediaView::new(cache.clone(), media_worker.clone()));
+        reading.update(cx, |r, _| r.media = Some(media.clone()));
+        let media_sub = cx.subscribe(&media, |this, _, ev: &crate::thread_media::MediaEvent, cx| this.on_media(ev, cx));
+        let (chats, mut chat_subs) = crate::chats::Chats::new(cache.clone(), media_worker, cx);
+        chat_subs.push(media_sub);
+        chat_subs.push(cx.observe(&media, |this, _, cx| this.reading.update(cx, |_, cx| cx.notify())));
         let subscriptions = vec![
             cx.subscribe(&tasks, |this, _, action: &crate::tasks::TasksAction, cx| this.on_tasks(action, cx)),
             cx.subscribe_in(&contacts, window, |this, _, action: &crate::contacts::ContactsAction, window, cx| this.on_contacts(action, window, cx)),
@@ -429,6 +438,7 @@ impl Mailer {
             backend: Backend::Demo,
             channels: Default::default(),
             chats,
+            media,
             live: Default::default(),
             newmail: Default::default(),
             rules_run: Default::default(),

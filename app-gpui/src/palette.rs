@@ -550,6 +550,7 @@ pub(crate) fn command_icon(id: &str) -> Option<char> {
         "mail.pin" => crate::chrome::glyph::PIN,
         "mail.mute" => crate::chrome::glyph::MUTED,
         // Беседа канала (CH-04).
+        "thread.media" => crate::chrome::glyph::ATTACH,
         "chat.pin" => crate::chrome::glyph::PIN,
         "chat.mute" => crate::chrome::glyph::MUTED,
         "chat.mark_read" => crate::chrome::glyph::READ,

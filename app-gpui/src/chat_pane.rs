@@ -63,6 +63,8 @@ pub(crate) enum PaneEvent {
     Copy(String),
     /// Действие довеска (кнопка бота, голос): ответ канала вернётся в [`ChatPane::extra_reply`].
     Extra(ChanAccount, Action),
+    /// Выгрузить файл в канал перед отправкой: итог вернётся в [`ChatPane::uploaded`].
+    Upload(ChanAccount, postman_core::channel::FileMeta, Vec<u8>),
 }
 
 impl EventEmitter<PaneEvent> for ChatPane {}
@@ -272,6 +274,8 @@ struct Open {
 
 pub(crate) struct ChatPane {
     cache: Cache,
+    /// «Медиа беседы» открытой беседы (MED-02): режим вместо ленты.
+    media: Entity<crate::thread_media::MediaView>,
     open: Option<Open>,
     input: Option<(Entity<TextareaState>, Subscription)>,
     focus_input: bool,
@@ -287,6 +291,9 @@ pub(crate) struct ChatPane {
     deleting: Option<(MessageId, bool)>,
     /// Эмодзи над полем ввода.
     emoji: bool,
+    /// Вложения следующего сообщения: уже выгруженные в канал и сколько ещё выгружается.
+    files: Vec<postman_core::channel::Uploaded>,
+    uploading: usize,
     /// Выбор в опросе с несколькими ответами, пока не нажато «Проголосовать»: сообщение и номера вариантов.
     picks: Option<(MessageId, Vec<usize>)>,
     /// Ответ бота предупреждением — строкой над полем ввода, до «ОК».
@@ -302,9 +309,10 @@ pub(crate) struct ChatPane {
 }
 
 impl ChatPane {
-    pub(crate) fn new(cache: Cache) -> Self {
+    pub(crate) fn new(cache: Cache, media: Entity<crate::thread_media::MediaView>) -> Self {
         Self {
             cache,
+            media,
             open: None,
             input: None,
             focus_input: false,
@@ -316,6 +324,8 @@ impl ChatPane {
             more: None,
             deleting: None,
             emoji: false,
+            files: Vec::new(),
+            uploading: 0,
             picks: None,
             alert: None,
             offered: None,
@@ -373,6 +383,8 @@ impl ChatPane {
         self.more = None;
         self.deleting = None;
         self.emoji = false;
+        self.files.clear();
+        self.uploading = 0;
         self.picks = None;
         self.alert = None;
         self.offered = None;
@@ -386,6 +398,7 @@ impl ChatPane {
         }
         self.reset_input_state();
         self.clear_text = true;
+        self.media.update(cx, |m, cx| m.set_source(Some(crate::thread_media::Source::Chat(at.clone())), cx));
         self.open = Some(Open { at, data: None, limit: PAGE, new_from: None, marked: None, loading: false, again: false });
         self.reload(cx);
         cx.notify();
@@ -394,6 +407,7 @@ impl ChatPane {
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.reset_input_state();
         self.open = None;
+        self.media.update(cx, |m, cx| m.set_source(None, cx));
         cx.notify();
     }
 
@@ -438,6 +452,10 @@ impl ChatPane {
                 o.data = Some(data);
                 if first || grew {
                     self.to_bottom = true;
+                }
+                // Новые сообщения — «Медиа беседы» собрать заново.
+                if grew {
+                    self.media.update(cx, |m, cx| m.reload(cx));
                 }
             }
             // Беседы больше нет (вышли, удалили).
@@ -572,8 +590,12 @@ impl ChatPane {
         let text = state.read(cx).value().trim().to_string();
         let Some(o) = &self.open else { return };
         let Some(d) = &o.data else { return };
-        if text.is_empty() {
+        // Пустое сообщение не уходит; вложения без текста — уходят.
+        if text.is_empty() && (self.files.is_empty() || self.editing.is_some()) {
             return;
+        }
+        if self.uploading > 0 {
+            return cx.emit(PaneEvent::Toast(Toast::Info, tr!("chats-wait-upload")));
         }
         if let Some(max) = d.features.max_text.filter(|max| text.chars().count() > *max as usize) {
             return cx.emit(PaneEvent::Toast(Toast::Warning, tr!("chats-too-long", max = i64::from(max))));
@@ -604,7 +626,7 @@ impl ChatPane {
                 conversation,
                 client_id,
                 body,
-                attachments: Vec::new(),
+                attachments: std::mem::take(&mut self.files),
                 reply_to: self.reply_to.take(),
                 quotes: Vec::new(),
                 mentions,
@@ -619,6 +641,103 @@ impl ChatPane {
         state.update(cx, |s, cx| s.set_value("", window, cx));
         self.to_bottom = true;
         cx.notify();
+    }
+
+    /// «Вложить»: выбор файлов; читаются в фоне и выгружаются в канал, затем — плашками над полем.
+    fn pick_files(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                let _ = this.update(cx, |p, cx| p.attach(paths, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn attach(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let Some(o) = &self.open else { return };
+        let (chan, max) = (o.at.chan(), o.data.as_ref().and_then(|d| d.features.max_attachment));
+        let task = cx.background_spawn(async move {
+            paths
+                .into_iter()
+                .map(|p| {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    (postman_core::files::safe_name(&name), std::fs::read(&p))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let files = task.await;
+            let _ = this.update(cx, |p, cx| {
+                // Беседу сменили, пока файлы читались, — им некуда.
+                if p.address().map(Address::chan) != Some(chan.clone()) {
+                    return;
+                }
+                for (name, data) in files {
+                    match data {
+                        Ok(bytes) if max.is_some_and(|m| bytes.len() as u64 > m) => {
+                            cx.emit(PaneEvent::Toast(Toast::Warning, tr!("chats-file-too-large", name = name)));
+                        }
+                        Ok(bytes) => {
+                            let meta =
+                                postman_core::channel::FileMeta { mime: postman_core::files::mime_for(&name).into(), size: bytes.len() as u64, name };
+                            p.uploading += 1;
+                            cx.emit(PaneEvent::Upload(chan.clone(), meta, bytes));
+                        }
+                        Err(e) => {
+                            tracing::warn!("chat: file not read: {e}");
+                            cx.emit(PaneEvent::Toast(Toast::Error, tr!("chats-file-unread", name = name)));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Файл выгружен в канал (или канал отказал): плашкой над полем, уйдёт со следующим сообщением.
+    pub(crate) fn uploaded(&mut self, result: Result<postman_core::channel::Uploaded, ChannelError>, cx: &mut Context<Self>) {
+        self.uploading = self.uploading.saturating_sub(1);
+        match result {
+            Ok(file) => self.files.push(file),
+            Err(e) => cx.emit(PaneEvent::Toast(Toast::Error, tr!("chats-upload-failed", why = chats::error_text(&e)))),
+        }
+        cx.notify();
+    }
+
+    /// Плашки вложений над полем: имя, размер, ✕; пока файлы выгружаются — подпись.
+    fn files_row(&self, l: &Look, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if self.files.is_empty() && self.uploading == 0 {
+            return None;
+        }
+        let chips = self.files.iter().enumerate().map(|(i, f)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(2.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(l.border())
+                .text_size(px(12.))
+                .child(icon(glyph::ATTACH, 12.).text_color(l.text2()))
+                .child(div().max_w(px(200.)).truncate().child(f.name.clone()))
+                .child(div().text_color(l.text2()).child(crate::attachments::size_text(f.size)))
+                .child(self.tool(("chat-file-remove", i), glyph::CLOSE, tr!("chats-file-remove"), l).size(px(20.)).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if i < this.files.len() {
+                            this.files.remove(i);
+                        }
+                        cx.notify();
+                    },
+                )))
+        });
+        Some(div().id("chat-files").flex().flex_wrap().items_center().gap(px(6.)).children(chips).when(self.uploading > 0, |d| {
+            d.child(div().text_size(px(12.)).text_color(l.text2()).child(tr!("chats-uploading", n = self.uploading as i64)))
+        }))
     }
 
     fn act(&self, action: impl FnOnce(ConversationId) -> Action, cx: &mut Context<Self>) {
@@ -1168,6 +1287,15 @@ impl ChatPane {
             .flex()
             .items_end()
             .gap(px(6.))
+            // «Вложить» — у нового сообщения; у правки вложения не меняются.
+            .when(self.editing.is_none(), |d| {
+                d.child(
+                    self.tool("chat-attach", glyph::ATTACH, tr!("chats-attach"), l)
+                        .children(crate::screens::spot("chat-attach"))
+                        .size(px(30.))
+                        .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx))),
+                )
+            })
             .child(div().flex_1().min_w_0().child(Textarea::new(state).appearance(false)))
             .child(
                 self.tool_with("chat-emoji-toggle", div().text_size(px(15.)).child("🙂"), tr!("chats-emoji"), l)
@@ -1206,6 +1334,7 @@ impl ChatPane {
                 .border_color(if focused { l.accent() } else { l.stroke() })
                 .bg(l.panel())
                 .children(self.draft_bar(d, l, cx))
+                .children(self.files_row(l, cx))
                 .when(emoji_on, |c| c.child(self.emoji_strip(l, cx)))
                 .child(field)
                 .into_any_element(),
@@ -1513,13 +1642,28 @@ impl Render for ChatPane {
             .flex_col()
             .text_color(l.text())
             .child(self.header(d, &l, cx))
-            .child(
-                div().relative().flex_1().min_h_0().flex().flex_col().child(tape_view).child(crate::chrome::vbar(&self.scroll, ScrollbarMode::Hover)),
-            )
-            .children(self.typing_line(d, &l))
-            .children(self.delete_line(&l, cx))
-            .children(self.reply_lines(&l, cx))
-            .children(self.composer(d, s, window, &l, cx))
+            // Режимы «Беседа | Медиа беседы» под шапкой (MED-02).
+            .child(div().flex_none().px(px(24.)).child(crate::thread_media::mode_tabs(&self.media, tr!("media-mode-talk"), &l, cx)))
+            .map(|pane| {
+                if self.media.read(cx).on {
+                    return pane.child(div().flex_1().min_h_0().px(px(24.)).py(px(12.)).child(self.media.clone()));
+                }
+                pane.children(crate::thread_media::summary(&self.media, &l, cx).map(|s| s.px(px(24.)).pt(px(8.)).pb(px(6.))))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(tape_view)
+                            .child(crate::chrome::vbar(&self.scroll, ScrollbarMode::Hover)),
+                    )
+                    .children(self.typing_line(d, &l))
+                    .children(self.delete_line(&l, cx))
+                    .children(self.reply_lines(&l, cx))
+                    .children(self.composer(d, s, window, &l, cx))
+            })
             .into_any_element()
     }
 }

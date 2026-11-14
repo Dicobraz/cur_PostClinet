@@ -118,3 +118,13 @@ chats-empty-person-text = Nothing was found in mail or in the connected channels
 chats-off-title = Conversation channels are off
 chats-off-text = Telegram and Matrix conversations next to mail: one timeline, shared search, smart folders.
 chats-turn-on = Turn on
+chats-attach = Attach a file
+chats-file-remove = Remove the attachment
+chats-uploading = { $n ->
+    [one] Uploading { $n } file…
+   *[other] Uploading { $n } files…
+}
+chats-wait-upload = The files are still uploading — send when it is done.
+chats-file-too-large = The file "{ $name }" is larger than the channel accepts.
+chats-file-unread = The file "{ $name }" could not be read.
+chats-upload-failed = The file was not uploaded. { $why }

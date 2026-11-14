@@ -2,6 +2,9 @@
 //! (CH-04) и ответу серверу — альбом (номера частей), кнопки бота (подпись и действие), опрос (вопрос, варианты,
 //! голоса, итоги). Ядро хранит байты, не разбирая; читает их канал и вид Telegram ([`TgExtra::parse`]).
 //!
+//! Нажать кнопку и проголосовать — `Action::Extra` с [`TgAct`] (тоже JSON): вид собирает его из довеска
+//! ([`TgAct::press`], [`TgAct::vote`]), канал выполняет и отвечает `Done::Reply`.
+//!
 //! Формат — JSON с номером версии `v`; новые поля — с `serde(default)`, старое читается как было. Нечего
 //! сказать — `extra` пуст (как до CH-03-хвостов).
 
@@ -146,7 +149,54 @@ pub struct PollAnswer {
     pub correct: bool,
 }
 
+/// Что сделать по довеску (`Action::Extra`, решение владельца 2026-11-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum TgAct {
+    /// Нажать кнопку бота (действие — как в [`Keyboard`]): ответ боту — `messages.getBotCallbackAnswer`, ссылка —
+    /// ответом без запроса к серверу.
+    Press { action: ButtonAction },
+    /// Голос в опросе: варианты — [`PollAnswer::option`]; пусто — отозвать голос (`messages.sendVote`).
+    Vote { options: Vec<Vec<u8>> },
+}
+
+impl TgAct {
+    /// `payload` для `Action::Extra`.
+    pub fn to_extra(&self) -> Extra {
+        Extra(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn parse(e: &Extra) -> Option<Self> {
+        serde_json::from_slice(&e.0).ok()
+    }
+
+    /// Нажать кнопку.
+    pub fn press(b: &Button) -> Extra {
+        TgAct::Press { action: b.action.clone() }.to_extra()
+    }
+
+    /// Голос за варианты опроса; пусто — отозвать.
+    pub fn vote(options: &[&PollAnswer]) -> Extra {
+        TgAct::Vote { options: options.iter().map(|a| a.option.clone()).collect() }.to_extra()
+    }
+}
+
 impl Poll {
+    /// Голос с вариантами `options` можно отдать: опрос открыт, вариантов не больше, чем позволяет опрос, все — его.
+    /// Отказ — имя ошибки сервера (то же ответил бы Telegram).
+    pub fn check_vote(&self, options: &[Vec<u8>]) -> Result<(), &'static str> {
+        if self.closed {
+            return Err("MESSAGE_POLL_CLOSED");
+        }
+        if options.len() > 1 && !self.multiple {
+            return Err("OPTIONS_TOO_MUCH");
+        }
+        if options.iter().any(|o| !self.answers.iter().any(|a| a.option == *o)) {
+            return Err("OPTION_INVALID");
+        }
+        Ok(())
+    }
+
     /// Я уже голосовал.
     pub fn voted(&self) -> bool {
         self.answers.iter().any(|a| a.chosen)
@@ -359,5 +409,24 @@ mod tests {
         assert_eq!(back.keyboard, e.keyboard);
         let old = TgExtra::parse(&Extra(br#"{"v":1,"poll":{"id":1,"question":"?","answers":[{"text":"a","option":[48]}]}}"#.to_vec())).unwrap();
         assert!(!old.poll.unwrap().voted());
+    }
+
+    /// Действие довеска туда и обратно; голос — по свойствам опроса.
+    #[test]
+    fn act_and_vote_rules() {
+        let b = Button { text: "Да".into(), action: ButtonAction::Callback { data: b"yes".to_vec(), password: false } };
+        assert_eq!(TgAct::parse(&TgAct::press(&b)), Some(TgAct::Press { action: b.action.clone() }));
+        assert_eq!(TgAct::parse(&Extra(b"not json".to_vec())), None);
+        let a = |o: u8| PollAnswer { text: "x".into(), option: vec![o], ..PollAnswer::default() };
+        let mut p = Poll { answers: vec![a(b'0'), a(b'1')], ..Poll::default() };
+        assert_eq!(TgAct::parse(&TgAct::vote(&[&p.answers[1]])), Some(TgAct::Vote { options: vec![vec![b'1']] }));
+        assert_eq!(p.check_vote(&[]), Ok(()), "отзыв голоса");
+        assert_eq!(p.check_vote(&[vec![b'0']]), Ok(()));
+        assert_eq!(p.check_vote(&[vec![b'0'], vec![b'1']]), Err("OPTIONS_TOO_MUCH"));
+        assert_eq!(p.check_vote(&[vec![b'7']]), Err("OPTION_INVALID"));
+        p.multiple = true;
+        assert_eq!(p.check_vote(&[vec![b'0'], vec![b'1']]), Ok(()));
+        p.closed = true;
+        assert_eq!(p.check_vote(&[vec![b'0']]), Err("MESSAGE_POLL_CLOSED"));
     }
 }

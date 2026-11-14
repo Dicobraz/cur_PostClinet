@@ -2,6 +2,9 @@
 //! ([`DemoServer`] как `conformance::Script`), свои часы. На нём договор каналов проверяется без сети
 //! (`postman_core::channel::conformance`), им же наполняются демо и снимки чатов (CH-04).
 //!
+//! Кнопки бота и опрос — довеском сообщения ([`DemoExtra`]); нажать и проголосовать — `Action::Extra` с
+//! [`DemoExtra::press`] и [`DemoExtra::vote`], ответ бота — `Done::Reply`.
+//!
 //! Как настоящий сервер: номера сообщений уникальны на учётку, удаление в личной беседе приходит без беседы
 //! (как у Telegram), повтор отправки с тем же `client_id` не даёт дубля, курсор — номер последнего события журнала.
 
@@ -10,12 +13,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use postman_core::backend::BoxFuture;
-use postman_core::channel::conformance::{Script, Step};
+use postman_core::channel::conformance::{self, Script, Step};
 use postman_core::channel::{
     AccountId, Action, Address, Answer, Attachment, AttachmentKind, AttachmentSource, Body, ByteSink, ByteSource, ChannelError, ChannelEvent,
     ChannelFeatures, ChannelFolder, ChannelId, ChannelPlugin, ChannelSession, ChannelState, CodeVia, ConnectCtx, Conversation, ConversationId,
-    ConversationKind, Counts, Cursor, Done, E2e, FileMeta, Flow, FlowCtx, FlowKind, FolderRef, Incoming, Limit, Member, Message, MessageId, Origin,
-    Page, Participant, ParticipantId, PluginStore, Prompt, Quote, Reaction, Reactions, Reader, Role, Secret, Uploaded, doc_text, text_doc,
+    ConversationKind, Counts, Cursor, Done, E2e, Extra, ExtraReply, FileMeta, Flow, FlowCtx, FlowKind, FolderRef, Incoming, Limit, Member, Message,
+    MessageId, Origin, Page, Participant, ParticipantId, PluginStore, Prompt, Quote, Reaction, Reactions, Reader, Role, Secret, Uploaded, doc_text,
+    text_doc,
 };
 
 /// id канала.
@@ -73,6 +77,153 @@ pub fn all_features() -> ChannelFeatures {
         e2e: E2e::Optional,
         max_attachment: Some(50 * 1024 * 1024),
         max_text: Some(4096),
+        extra: true,
+    }
+}
+
+/// Ссылка кнопки «Журнал» бота сборки.
+pub const BUILD_LOG: &str = "https://ci.example.test/build/128";
+
+/// Довесок демо-канала в `Message::extra`: кнопки бота и опрос — строками «вид, табуляция, поля» (формат демо; ядро
+/// его не разбирает).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DemoExtra {
+    pub buttons: Vec<DemoButton>,
+    pub poll: Option<DemoPoll>,
+}
+
+/// Кнопка бота.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DemoButton {
+    /// Ответ боту: `data` получит бот, его ответ — `Done::Reply`.
+    Callback { text: String, data: String },
+    /// Ссылка: отдаётся ответом без запроса к серверу, открывает её пользователь.
+    Url { text: String, url: String },
+}
+
+/// Опрос и итоги.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DemoPoll {
+    pub question: String,
+    pub multiple: bool,
+    pub closed: bool,
+    pub options: Vec<DemoOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DemoOption {
+    pub text: String,
+    pub votes: u32,
+    /// Мой голос.
+    pub chosen: bool,
+}
+
+fn flag(b: bool) -> &'static str {
+    if b { "1" } else { "0" }
+}
+
+impl DemoExtra {
+    /// Байты `extra`.
+    pub fn to_extra(&self) -> Extra {
+        let mut lines = Vec::new();
+        for b in &self.buttons {
+            lines.push(match b {
+                DemoButton::Callback { text, data } => format!("button\t{text}\t{data}"),
+                DemoButton::Url { text, url } => format!("url\t{text}\t{url}"),
+            });
+        }
+        if let Some(p) = &self.poll {
+            lines.push(format!("poll\t{}\t{}\t{}", p.question, flag(p.multiple), flag(p.closed)));
+            lines.extend(p.options.iter().map(|o| format!("option\t{}\t{}\t{}", o.text, o.votes, flag(o.chosen))));
+        }
+        Extra(lines.join("\n").into_bytes())
+    }
+
+    /// Довесок демо из `extra`; пусто или чужое — `None`.
+    pub fn parse(e: &Extra) -> Option<Self> {
+        let text = std::str::from_utf8(&e.0).ok().filter(|t| !t.is_empty())?;
+        let mut out = DemoExtra::default();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["button", text, data] => out.buttons.push(DemoButton::Callback { text: (*text).into(), data: (*data).into() }),
+                ["url", text, url] => out.buttons.push(DemoButton::Url { text: (*text).into(), url: (*url).into() }),
+                ["poll", q, m, c] => out.poll = Some(DemoPoll { question: (*q).into(), multiple: *m == "1", closed: *c == "1", options: Vec::new() }),
+                ["option", text, votes, chosen] => {
+                    out.poll.as_mut()?.options.push(DemoOption { text: (*text).into(), votes: votes.parse().ok()?, chosen: *chosen == "1" });
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// `Action::Extra`: нажать кнопку номер `n` (по порядку в [`DemoExtra::buttons`]).
+    pub fn press(n: usize) -> Extra {
+        Extra(format!("press\t{n}").into_bytes())
+    }
+
+    /// `Action::Extra`: голос за варианты по номерам; пусто — отозвать голос.
+    pub fn vote(options: &[usize]) -> Extra {
+        let picks: Vec<String> = options.iter().map(usize::to_string).collect();
+        Extra(format!("vote\t{}", picks.join(",")).into_bytes())
+    }
+}
+
+/// Ответ бота сборки на кнопку.
+fn bot_answer(data: &str) -> Result<ExtraReply, ChannelError> {
+    match data {
+        "restart" => Ok(ExtraReply { text: Some("Сборка №128 перезапущена".into()), ..ExtraReply::default() }),
+        "cancel" => Ok(ExtraReply { text: Some("Отменить нельзя: сборка уже прошла.".into()), alert: true, url: None }),
+        "hide" => Ok(ExtraReply::default()),
+        _ => Err(ChannelError::Denied("bot did not answer".into())),
+    }
+}
+
+fn bad_payload() -> ChannelError {
+    ChannelError::Protocol("extra payload".into())
+}
+
+/// Действие довеска у сообщения `m`: кнопка — ответ бота или ссылка; голос — новые итоги (сообщение меняется).
+fn extra_act(m: &mut Message, payload: &Extra) -> Result<(Option<Message>, Done), ChannelError> {
+    let mut more = DemoExtra::parse(&m.extra).ok_or(ChannelError::NotFound)?;
+    let text = std::str::from_utf8(&payload.0).map_err(|_| bad_payload())?;
+    let (kind, arg) = text.split_once('\t').unwrap_or((text, ""));
+    match kind {
+        "press" => {
+            let n: usize = arg.parse().map_err(|_| bad_payload())?;
+            let reply = match more.buttons.get(n).ok_or(ChannelError::NotFound)? {
+                DemoButton::Url { url, .. } => ExtraReply { url: Some(url.clone()), ..ExtraReply::default() },
+                DemoButton::Callback { data, .. } => bot_answer(data)?,
+            };
+            Ok((None, Done::Reply(reply)))
+        }
+        "vote" => {
+            let poll = more.poll.as_mut().ok_or(ChannelError::NotFound)?;
+            let picks: Vec<usize> =
+                if arg.is_empty() { Vec::new() } else { arg.split(',').map(str::parse).collect::<Result<_, _>>().map_err(|_| bad_payload())? };
+            if poll.closed {
+                return Err(ChannelError::Denied("poll closed".into()));
+            }
+            if picks.len() > 1 && !poll.multiple {
+                return Err(ChannelError::Denied("single-choice poll".into()));
+            }
+            if picks.iter().any(|i| *i >= poll.options.len()) {
+                return Err(ChannelError::Denied("no such option".into()));
+            }
+            for (i, o) in poll.options.iter_mut().enumerate() {
+                if o.chosen {
+                    o.votes = o.votes.saturating_sub(1);
+                }
+                o.chosen = picks.contains(&i);
+                if o.chosen {
+                    o.votes += 1;
+                }
+            }
+            m.extra = more.to_extra();
+            Ok((Some(m.clone()), Done::Ok))
+        }
+        _ => Err(bad_payload()),
     }
 }
 
@@ -214,6 +365,16 @@ impl DemoServer {
         group.push(s.message(BORIS, "Коллеги, сборка 0.1 готова к проверке."));
         let first = group[0].id.clone();
         let mut m = s.message(BOT, "Сборка №128: тесты зелёные.");
+        m.extra = DemoExtra {
+            buttons: vec![
+                DemoButton::Callback { text: "Перезапустить".into(), data: "restart".into() },
+                DemoButton::Callback { text: "Отменить".into(), data: "cancel".into() },
+                DemoButton::Url { text: "Журнал".into(), url: BUILD_LOG.into() },
+                DemoButton::Callback { text: "Скрыть".into(), data: "hide".into() },
+            ],
+            poll: None,
+        }
+        .to_extra();
         m.reactions = vec![Reaction { key: "👍".into(), count: 2, mine: true, who: vec![ParticipantId::new(ME_ID), ParticipantId::new(BORIS)] }];
         group.push(m);
         let mut m = s.message(ANNA, "@Я посмотри, пожалуйста, раздел рисков.");
@@ -227,6 +388,20 @@ impl DemoServer {
         group.push(s.message(ME_ID, "Принято, беру риски на себя."));
 
         let news = vec![s.message(BORIS, "Обновление 0.1.0-beta.7 вышло."), s.message(BORIS, "Плановые работы в субботу.")];
+        // Опрос в группе — последним: номера прежних сообщений не сдвигаются.
+        let mut m = s.message(ANNA, "");
+        let option = |text: &str, votes| DemoOption { text: text.into(), votes, chosen: false };
+        m.extra = DemoExtra {
+            buttons: Vec::new(),
+            poll: Some(DemoPoll {
+                question: "Когда созвон по рискам?".into(),
+                multiple: false,
+                closed: false,
+                options: vec![option("Понедельник", 1), option("Среда", 2), option("Пятница", 0)],
+            }),
+        }
+        .to_extra();
+        group.push(m);
 
         let conv = |id: &str, kind, title: &str, role, messages: Vec<Message>, ms: Vec<Member>| Conv {
             info: Conversation {
@@ -303,6 +478,27 @@ impl Script for DemoServer {
             Step::Gap,
             Step::Wait,
             Step::LinkDrop,
+        ]
+    }
+
+    /// Кнопки бота сборки (ответ, предупреждение, ссылка, молча) и опрос группы (голос, лишний вариант, отзыв).
+    fn extra(&self) -> Vec<conformance::ExtraProbe> {
+        use conformance::{ExtraExpect as E, ExtraProbe};
+        let s = self.lock();
+        let group = ConversationId::new(GROUP);
+        let Some(c) = s.convs.iter().find(|c| c.info.id == group) else { return Vec::new() };
+        let find =
+            |poll: bool| c.messages.iter().find(|m| DemoExtra::parse(&m.extra).is_some_and(|e| e.poll.is_some() == poll)).map(|m| m.id.clone());
+        let (Some(bot), Some(poll)) = (find(false), find(true)) else { return Vec::new() };
+        let probe = |message: &MessageId, payload, expect| ExtraProbe { conversation: group.clone(), message: message.clone(), payload, expect };
+        vec![
+            probe(&bot, DemoExtra::press(0), E::Reply(bot_answer("restart").unwrap_or_default())),
+            probe(&bot, DemoExtra::press(1), E::Reply(bot_answer("cancel").unwrap_or_default())),
+            probe(&bot, DemoExtra::press(2), E::Reply(ExtraReply { url: Some(BUILD_LOG.into()), ..ExtraReply::default() })),
+            probe(&bot, DemoExtra::press(3), E::Reply(ExtraReply::default())),
+            probe(&poll, DemoExtra::vote(&[0]), E::Updated),
+            probe(&poll, DemoExtra::vote(&[0, 1]), E::Refused),
+            probe(&poll, DemoExtra::vote(&[]), E::Updated),
         ]
     }
 
@@ -671,6 +867,15 @@ fn act(s: &mut State, action: Action) -> Result<Done, ChannelError> {
             Ok(Done::Conversation(id))
         }
         Action::Members { conversation } => Ok(Done::Members(s.conv(&conversation)?.members.clone())),
+        Action::Extra { conversation, message, payload } => {
+            let c = s.conv(&conversation)?;
+            let m = c.messages.iter_mut().find(|m| m.id == message).ok_or(ChannelError::NotFound)?;
+            let (changed, done) = extra_act(m, &payload)?;
+            if let Some(m) = changed {
+                s.emit(ChannelEvent::Messages { conversation, messages: vec![m], live: false });
+            }
+            Ok(done)
+        }
         Action::Resolve { link } => {
             let rest = link.strip_prefix(LINK).ok_or(ChannelError::NotFound)?;
             let (conv, msg) = rest.split_once('/').map_or((rest, None), |(c, m)| (c, Some(m)));
@@ -682,6 +887,7 @@ fn act(s: &mut State, action: Action) -> Result<Done, ChannelError> {
                 message: msg.map(MessageId::new),
             }))
         }
+        _ => Err(ChannelError::Unsupported),
     }
 }
 

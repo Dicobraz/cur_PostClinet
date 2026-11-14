@@ -268,6 +268,7 @@ pub struct ChannelFeatures {
     pub e2e: E2e,                    // No | Optional | Always
     pub max_attachment: Option<u64>, // байт
     pub max_text: Option<u32>,       // знаков
+    pub extra: bool,                 // действия довеска: кнопки ботов, голос в опросах (Action::Extra)
 }
 ```
 
@@ -328,6 +329,7 @@ pub enum Action {
     Start { with: Vec<ParticipantId> },                                            // новая личная беседа или группа
     Members { conversation: ConversationId },
     Resolve { link: String },                                                      // t.me/…, matrix.to/…
+    Extra { conversation: ConversationId, message: MessageId, payload: Extra },  // только extra; см. «Решения» п. 3
 }
 
 pub struct Outgoing {
@@ -343,7 +345,10 @@ pub struct Outgoing {
     pub silent: bool,
 }
 
-pub enum Done { Ok, Sent { client_id: u64, id: MessageId, at: i64 }, Conversation(ConversationId), Members(Vec<Member>), Address(Address) }
+pub enum Done {
+    Ok, Sent { client_id: u64, id: MessageId, at: i64 }, Conversation(ConversationId), Members(Vec<Member>), Address(Address),
+    Reply(ExtraReply),                   // ответ канала на Action::Extra
+}
 
 pub enum ChannelError {
     Network(String), SignedOut(String), Wait { secs: u32 }, Denied(String), NotFound,
@@ -670,3 +675,39 @@ channel::Request }` и `sync::Event::Channel(channel::Update)`; маршрут �
 (JSContact `onlineServices`, vCard `IMPP`, адреса чата Exchange) только по явному «Связать с контактом»;
 автоматические совпадения на сервер не пишутся. Контакты справочника организации (GAL) сервер менять не даёт — для
 них связь хранится в базе профиля.
+
+### 3. Действия довеска: нажать кнопку бота, проголосовать
+
+Что это: под сообщениями ботов бывают кнопки, в группах — опросы. Их данные канал кладёт в довесок `Message::extra`
+(ядро хранит, не разбирая). Чтобы нажать или проголосовать, ядру нужно передать каналу команду; варианты — одно общее
+действие (А), по действию на каждую особенность (Б), не делать (В).
+
+**Решено владельцем (2026-11-14): А — одно общее действие** `Action::Extra { conversation, message, payload: Extra }`:
+«выполнить то, что описано в довеске канала». Ядро `payload` не разбирает.
+
+- **Кто собирает `payload`.** Канал: вид беседы показывает кнопки и опрос по довеску сообщения и берёт действие у
+  канала (Telegram — `extra::TgAct::press` по кнопке, `TgAct::vote` по вариантам; демо — `DemoExtra::press`,
+  `DemoExtra::vote`). Формат — канала (Telegram — JSON, как и довесок).
+- **Возможность.** `ChannelFeatures::extra`; нет флага — нет кнопок для нажатия и голоса на экране («нет у сервера —
+  нет на экране»), а `Request::Act` с `Extra` поток учётки отклоняет `Unsupported` без запроса к каналу. Почта и
+  каналы без поддержки отвечают `Unsupported`.
+- **Итог.** `Done::Reply(ExtraReply { text, alert, url })` — ответ канала: текст всплывающей подсказкой или, при
+  `alert`, предупреждением с «ОК»; ссылка, которую предлагают открыть. Пустой ответ — «принято» молча. Отказ (бот не
+  ответил, опрос закрыт, лишний или чужой вариант) — `ChannelError::Denied` с именем причины. Голос отвечает
+  `Done::Ok`, итоги опроса приходят событием канала (сообщение заново, `Messages`) — и от своего голоса, и от чужих.
+- **Как ответ доходит до интерфейса.** Событием `Update::Acted { ticket, result: Ok(Done::Reply(…)) }` на тот
+  `ticket`, с которым ушёл `Request::Act`. Ссылку из ответа интерфейс только показывает; переход — по нажатию
+  пользователя (как ссылка в письме), сам Postman её не открывает.
+- **Telegram.** Кнопка ответа боту — `messages.getBotCallbackAnswer` (данные кнопки; ответ — `message`, `alert`,
+  `url`); кнопка-ссылка (`url`, вход на сайт) — ссылкой без запроса к серверу; кнопка с паролем двухэтапной проверки,
+  клавиатура бота, мини-приложения, игры, оплата — `Unsupported` (у вида беседы или на телефоне). Голос —
+  `messages.sendVote`: один или несколько вариантов по свойствам опроса (`multiple`), пусто — отзыв голоса; закрытый
+  опрос и лишние варианты отклоняются до запроса (по известному опросу) или сервером. Итоги — `updateMessagePoll` в
+  ответе и в потоке. В журнале — ни данных кнопок, ни текста ответов.
+- **Matrix** (CH-05) — позже свои действия (опросы MSC3381) тем же `Action::Extra`.
+- **Договор.** `Action` помечен `#[non_exhaustive]`: канал вне ядра разбирает действия с веткой
+  `_ => Err(ChannelError::Unsupported)`, и следующее новое действие не ломает его сборку. Значение учётки в базе —
+  с версией (`AccountEnvelope::V3`): записанное до флага `extra` читается, флаг узнаётся при подключении.
+- **Проверки.** `channel::conformance`: без флага — `Action::Extra` отвечает `Unsupported` (и напрямую, и через поток
+  учётки); с флагом — пробы сценария канала (`Script::extra`: ответ, новые итоги, отказ) и неизвестная беседа —
+  `NotFound`; ответ через поток — `Update::Acted` с `Done::Reply`.

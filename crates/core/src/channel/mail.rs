@@ -143,7 +143,8 @@ impl MailAccount {
 
 /// Что умеет почта как канал (ADR 0012 п. 7): правки, удаления у всех, реакций, «печатает» и «прочитано»
 /// собеседником нет; ответ, цитаты, упоминания — есть; отложенная отправка — по `Release` пути; заглушить и
-/// закрепить — ключевыми словами на сервере; сквозное шифрование — S/MIME по желанию; предел вложения — сервера.
+/// закрепить — ключевыми словами на сервере; сквозное шифрование — S/MIME по желанию; предел вложения — сервера;
+/// действий довеска ([`super::Action::Extra`]) нет — `Unsupported`.
 pub fn features(max_attachment: Option<u64>) -> ChannelFeatures {
     ChannelFeatures {
         edit: Limit::No,
@@ -687,6 +688,11 @@ mod tests {
         assert!(p.commands.is_empty(), "не закреплено — снимать нечего");
         let edit = super::super::Action::Edit { conversation: conv, message: MessageId::new("x"), body: Default::default(), mentions: vec![] };
         assert!(matches!(s.plan(&act(edit)), Err(ChannelError::Unsupported)));
+        // Кнопок ботов и опросов у почты нет: действие довеска — отказ, флага нет.
+        let extra =
+            super::super::Action::Extra { conversation: ConversationId::new("t1"), message: MessageId::new("x"), payload: Default::default() };
+        assert!(!features(None).allows(&extra));
+        assert!(matches!(s.plan(&act(extra)), Err(ChannelError::Unsupported)));
         assert!(!features(None).allows(&super::super::Action::Typing { conversation: ConversationId::default(), on: true }));
         assert!(matches!(update(&Event::Status(Status::Synced)), Some(Update::State(ChannelState::Online))));
     }

@@ -38,26 +38,92 @@ struct AccountValue {
     me: Option<Participant>,
 }
 
+/// Возможности до `extra` (действия довеска, 2026-11-14): postcard не знает имён полей, прежние байты — этим видом.
+#[derive(Serialize, Deserialize)]
+struct FeaturesV1 {
+    edit: super::Limit,
+    delete_for_all: super::Limit,
+    reactions: super::Reactions,
+    read_receipts: bool,
+    typing: bool,
+    reply_to: bool,
+    quote_fragment: bool,
+    mentions: bool,
+    forward_native: bool,
+    scheduled_send: bool,
+    server_drafts: bool,
+    server_mute: bool,
+    server_pin: bool,
+    server_search: bool,
+    server_unread: bool,
+    folders: bool,
+    threads: bool,
+    e2e: super::E2e,
+    max_attachment: Option<u64>,
+    max_text: Option<u32>,
+}
+
+impl From<FeaturesV1> for ChannelFeatures {
+    fn from(f: FeaturesV1) -> Self {
+        ChannelFeatures {
+            edit: f.edit,
+            delete_for_all: f.delete_for_all,
+            reactions: f.reactions,
+            read_receipts: f.read_receipts,
+            typing: f.typing,
+            reply_to: f.reply_to,
+            quote_fragment: f.quote_fragment,
+            mentions: f.mentions,
+            forward_native: f.forward_native,
+            scheduled_send: f.scheduled_send,
+            server_drafts: f.server_drafts,
+            server_mute: f.server_mute,
+            server_pin: f.server_pin,
+            server_search: f.server_search,
+            server_unread: f.server_unread,
+            folders: f.folders,
+            threads: f.threads,
+            e2e: f.e2e,
+            max_attachment: f.max_attachment,
+            max_text: f.max_text,
+            // Узнает при подключении (`Update::Connected`, `ChannelEvent::Features`).
+            extra: false,
+        }
+    }
+}
+
 /// Значение учётки до `me` (CH-02а).
 #[derive(Serialize, Deserialize)]
 struct AccountValueV1 {
     name: String,
-    features: ChannelFeatures,
+    features: FeaturesV1,
     folders: Vec<ChannelFolder>,
     state: Option<ChannelState>,
+}
+
+/// Значение учётки до `ChannelFeatures::extra`.
+#[derive(Serialize, Deserialize)]
+struct AccountValueV2 {
+    name: String,
+    features: FeaturesV1,
+    folders: Vec<ChannelFolder>,
+    state: Option<ChannelState>,
+    me: Option<Participant>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum AccountEnvelope {
     V1(AccountValueV1),
-    V2(AccountValue),
+    V2(AccountValueV2),
+    V3(AccountValue),
 }
 
 impl AccountEnvelope {
     fn value(self) -> AccountValue {
         match self {
-            AccountEnvelope::V1(v) => AccountValue { name: v.name, features: v.features, folders: v.folders, state: v.state, me: None },
-            AccountEnvelope::V2(v) => v,
+            AccountEnvelope::V1(v) => AccountValue { name: v.name, features: v.features.into(), folders: v.folders, state: v.state, me: None },
+            AccountEnvelope::V2(v) => AccountValue { name: v.name, features: v.features.into(), folders: v.folders, state: v.state, me: v.me },
+            AccountEnvelope::V3(v) => v,
         }
     }
 }
@@ -225,7 +291,7 @@ impl ChannelStore {
             None => {
                 let b = cache.chan_batch()?;
                 let value = AccountValue { name: name.to_owned(), ..AccountValue::default() };
-                let key = b.add_account(&channel.0, &account.0, &enc(&AccountEnvelope::V2(value))?)?;
+                let key = b.add_account(&channel.0, &account.0, &enc(&AccountEnvelope::V3(value))?)?;
                 b.commit()?;
                 key
             }
@@ -309,7 +375,7 @@ impl ChannelStore {
         }
         v.me = Some(me.clone());
         let b = self.cache.chan_batch()?;
-        b.set_account_value(self.key, &enc(&AccountEnvelope::V2(v))?)?;
+        b.set_account_value(self.key, &enc(&AccountEnvelope::V3(v))?)?;
         Ok(b.commit()?)
     }
 
@@ -533,7 +599,7 @@ impl ChannelStore {
             }
         }
         if let Some(v) = account {
-            b.set_account_value(self.key, &enc(&AccountEnvelope::V2(v))?)?;
+            b.set_account_value(self.key, &enc(&AccountEnvelope::V3(v))?)?;
         }
         b.commit()?;
         Ok(out)
@@ -776,6 +842,9 @@ mod tests {
         assert_eq!(applied.typing.len(), 1);
         assert_eq!(s.features().unwrap(), f);
         assert_eq!(s.state().unwrap(), Some(ChannelState::Online));
+        let f = ChannelFeatures { extra: true, ..f };
+        s.apply(vec![ChannelEvent::Features(f.clone())]).unwrap();
+        assert_eq!(s.features().unwrap(), f, "флаг действий довеска хранится");
         assert_eq!(s.participant(&ParticipantId::new("p1")).unwrap().unwrap().name, "Анна");
         assert_eq!(s.members(&c).unwrap(), vec![Member { id: ParticipantId::new("p1"), role: Role::Admin }]);
         let mut d = s.begin_download();
@@ -786,5 +855,44 @@ mod tests {
         s.forget().unwrap();
         assert!(ChannelStore::conversations(s.cache(), 0, 10).unwrap().is_empty());
         assert!(s.cache().chan_accounts().unwrap().is_empty());
+    }
+
+    /// Учётка, записанная до `ChannelFeatures::extra` (V2), читается: возможности те же, действий довеска нет до
+    /// подключения.
+    #[test]
+    fn account_before_extra_is_read() {
+        let old = AccountValueV2 {
+            name: "Я".into(),
+            features: FeaturesV1 {
+                edit: super::super::Limit::Always,
+                delete_for_all: super::super::Limit::No,
+                reactions: super::super::Reactions::Any,
+                read_receipts: true,
+                typing: true,
+                reply_to: false,
+                quote_fragment: false,
+                mentions: false,
+                forward_native: false,
+                scheduled_send: false,
+                server_drafts: false,
+                server_mute: true,
+                server_pin: false,
+                server_search: false,
+                server_unread: false,
+                folders: false,
+                threads: false,
+                e2e: super::super::E2e::No,
+                max_attachment: Some(10),
+                max_text: Some(20),
+            },
+            folders: Vec::new(),
+            state: Some(ChannelState::Online),
+            me: Some(Participant { id: ParticipantId::new("p1"), ..Participant::default() }),
+        };
+        let v = dec::<AccountEnvelope>(&enc(&AccountEnvelope::V2(old)).unwrap()).unwrap().value();
+        assert_eq!(v.name, "Я");
+        assert!(v.features.typing && v.features.server_mute && !v.features.extra);
+        assert_eq!((v.features.max_attachment, v.features.max_text), (Some(10), Some(20)));
+        assert_eq!(v.me.map(|m| m.id), Some(ParticipantId::new("p1")));
     }
 }

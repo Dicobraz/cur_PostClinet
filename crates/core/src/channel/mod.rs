@@ -1,7 +1,8 @@
 //! Каналы бесед (ADR 0012): протокол — в канале, всё остальное — в ядре один раз.
 //!
 //! - **Договор** ([`ChannelPlugin`], [`ChannelSession`], [`Flow`]): канал — вход и сессия, догнать сервер от курсора,
-//!   поток событий ([`ChannelEvent`]), действия ([`Action`]), загрузка и выгрузка файлов, перевод формата в общую
+//!   поток событий ([`ChannelEvent`]), действия ([`Action`]; действие довеска — [`Action::Extra`], ответ —
+//!   [`Done::Reply`]), загрузка и выгрузка файлов, перевод формата в общую
 //!   модель. Канал **не видит** хранилища, индекса, воркера и секретов: отдаёт значения модели, пишет их ядро.
 //! - **Модель** (этот модуль): адреса `postman://` из id сервера ([`Address`]), беседа, сообщение, участник,
 //!   вложение; что умеет канал — [`ChannelFeatures`] («Нет у сервера — нет на экране»).
@@ -221,7 +222,8 @@ pub fn account_prefix(chan: &ChanAccount) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Cursor(pub Vec<u8>);
 
-/// Поля канала сверх модели (кнопки ботов, опросы, геометка): ядро хранит, но не понимает.
+/// Поля канала сверх модели (кнопки ботов, опросы, геометка): ядро хранит, но не понимает. Тот же тип — у
+/// [`Action::Extra`]: что сделать по довеску (нажать кнопку, проголосовать), формат — канала.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Extra(pub Vec<u8>);
 
@@ -619,6 +621,9 @@ pub struct ChannelFeatures {
     pub max_attachment: Option<u64>,
     /// Знаков.
     pub max_text: Option<u32>,
+    /// Действия довеска ([`Action::Extra`]): нажать кнопку бота, проголосовать в опросе. Нет — кнопок и опросов не
+    /// нажать (видно только то, что лежит в `extra`).
+    pub extra: bool,
 }
 
 impl ChannelFeatures {
@@ -634,6 +639,7 @@ impl ChannelFeatures {
             Action::Mute { .. } => self.server_mute,
             Action::Pin { .. } => self.server_pin,
             Action::SaveDraft { .. } => self.server_drafts,
+            Action::Extra { .. } => self.extra,
             Action::MarkRead { .. } | Action::Start { .. } | Action::Members { .. } | Action::Resolve { .. } => true,
         }
     }
@@ -727,7 +733,11 @@ pub struct Outgoing {
 }
 
 /// От ядра к каналу ([`ChannelSession::act`]).
+///
+/// `non_exhaustive`: канал вне ядра разбирает действия с веткой `_ => Err(ChannelError::Unsupported)` — новое действие
+/// договора не ломает его сборку, а до канала без возможности ядро его и не доносит ([`ChannelFeatures::allows`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Action {
     Send(Outgoing),
     Edit {
@@ -787,16 +797,42 @@ pub enum Action {
     Resolve {
         link: String,
     },
+    /// Только `extra` (решение владельца 2026-11-14): выполнить то, что описано в довеске канала у сообщения —
+    /// нажать кнопку бота, проголосовать или отозвать голос. `payload` собирает и разбирает канал (вид беседы берёт
+    /// его у канала по `Message::extra`), ядро не разбирает. Итог — [`Done::Reply`] (ответ бота) или [`Done::Ok`].
+    Extra {
+        conversation: ConversationId,
+        message: MessageId,
+        payload: Extra,
+    },
+}
+
+/// Ответ канала на [`Action::Extra`]: всплывающий ответ бота. Пустой — канал принял молча («принято»); отказ (бот не
+/// ответил, опрос закрыт) — ошибкой [`ChannelError`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExtraReply {
+    /// Текст ответа.
+    pub text: Option<String>,
+    /// Показать предупреждением (окно с «ОК»), иначе — всплывающей подсказкой.
+    pub alert: bool,
+    /// Ссылка, которую канал предлагает открыть: интерфейс только показывает её, переход — по нажатию пользователя.
+    pub url: Option<String>,
 }
 
 /// Итог действия.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Done {
     Ok,
-    Sent { client_id: u64, id: MessageId, at: i64 },
+    Sent {
+        client_id: u64,
+        id: MessageId,
+        at: i64,
+    },
     Conversation(ConversationId),
     Members(Vec<Member>),
     Address(Address),
+    /// Ответ на [`Action::Extra`]; интерфейсу — событием `run::Update::Acted`.
+    Reply(ExtraReply),
 }
 
 /// Ошибка канала: «Проблема → причина → исправление» у интерфейса; журнал — по-английски, без текста сообщений и
@@ -865,6 +901,9 @@ mod tests {
         assert!(!f.allows(&Action::Typing { conversation: ConversationId::default(), on: true }));
         assert!(f.allows(&Action::Delete { conversation: ConversationId::default(), ids: vec![], for_all: false }));
         assert!(!f.allows(&Action::Delete { conversation: ConversationId::default(), ids: vec![], for_all: true }));
+        let extra = Action::Extra { conversation: ConversationId::default(), message: MessageId::default(), payload: Extra::default() };
+        assert!(!f.allows(&extra), "нет флага — действие довеска не доходит до канала");
+        assert!(ChannelFeatures { extra: true, ..ChannelFeatures::default() }.allows(&extra));
     }
 
     #[test]

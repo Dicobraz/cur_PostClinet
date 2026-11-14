@@ -3,7 +3,8 @@
 //! супергруппа, канал в архиве, папка; сообщения с сущностями, ответом с цитатой и файлом; вход телефоном, кодом и
 //! паролем (SRP), вход по QR; отправка (короткий ответ в личной беседе, полный — в группах и с файлом), правка,
 //! удаление, реакции, «прочитано», файлы кусками, просроченная ссылка на файл; альбомы (`uploadMedia`,
-//! `sendMultiMedia`, `grouped_id`), кнопки бота, опрос, папки с правилами. События «от других» — сценарием
+//! `sendMultiMedia`, `grouped_id`), кнопки бота и их ответы (`getBotCallbackAnswer`), опрос и голос (`sendVote`),
+//! папки с правилами. События «от других» — сценарием
 //! ([`Script`]) и методами `*_by_other`. Данные — вымышленные (`+999…`, `*_example`).
 
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,11 @@ pub const PASSWORD: &str = "пароль проверки";
 pub const GROUP: i64 = 5001;
 /// Опрос в группе «Семья».
 pub const POLL: i64 = 880_001;
+/// Ссылка кнопки «Справка» бота.
+pub const HELP: &str = "https://example.test/help";
+/// Ответы бота на кнопки «Да» (подсказкой) и «Нет» (предупреждением); «Скрыть» — молча.
+pub const BOT_YES: &str = "Принято";
+pub const BOT_NO: &str = "Точно нет?";
 /// Альбом из двух фото в «Команде».
 pub const TEAM_ALBUM: i64 = 990_001;
 /// Папки сервера: «Работа» — по правилу «контакты» и с «Командой»; «Непрочитанное» — все типы без заглушённых,
@@ -101,7 +107,9 @@ struct FakePoll {
     id: i64,
     question: String,
     answers: Vec<(String, i32)>,
-    mine: Option<usize>,
+    mine: Vec<usize>,
+    multiple: bool,
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -404,7 +412,10 @@ fn inline_keyboard() -> tl::enums::ReplyMarkup {
             }
             .into(),
             tl::types::KeyboardInlineButtonRow {
-                buttons: vec![button("Справка", tl::types::InlineButtonTypeUrl { url: "https://example.test/help".into() }.into())],
+                buttons: vec![
+                    button("Справка", tl::types::InlineButtonTypeUrl { url: HELP.into() }.into()),
+                    button("Скрыть", tl::types::InlineButtonTypeCallback { requires_password: false, data: b"hide".to_vec() }.into()),
+                ],
             }
             .into(),
         ],
@@ -417,9 +428,9 @@ impl FakePoll {
         let option = |i: usize| vec![b'0' + u8::try_from(i).unwrap_or(0)];
         let poll = tl::types::Poll {
             id: self.id,
-            closed: false,
+            closed: self.closed,
             public_voters: false,
-            multiple_choice: false,
+            multiple_choice: self.multiple,
             quiz: false,
             open_answers: false,
             revoting_disabled: false,
@@ -454,7 +465,7 @@ impl FakePoll {
                     .enumerate()
                     .map(|(i, (_, n))| {
                         tl::types::PollAnswerVoters {
-                            chosen: self.mine == Some(i),
+                            chosen: self.mine.contains(&i),
                             correct: false,
                             option: option(i),
                             voters: Some(*n),
@@ -525,7 +536,12 @@ impl FakeTelegram {
         let p = s.add(Peer::Chat(GROUP), Some(ANNA), "", vec![], None, None);
         s.set(Peer::Chat(GROUP), p, |m| {
             m.poll = Some(FakePoll {
-                id: POLL, question: "Куда поедем?".into(), answers: vec![("Лес".into(), 1), ("Море".into(), 2)], mine: Some(1)
+                id: POLL,
+                question: "Куда поедем?".into(),
+                answers: vec![("Лес".into(), 1), ("Море".into(), 2)],
+                mine: vec![1],
+                multiple: false,
+                closed: false,
             })
         });
         s.add(Peer::Channel(NEWS), None, "Новость дня", vec![], None, None);
@@ -646,6 +662,29 @@ impl FakeTelegram {
         s.push(vec![
             tl::types::UpdateMessagePoll { peer: Some(peer.to_tl()), msg_id: Some(id), top_msg_id: None, poll_id, poll: None, results }.into(),
         ]);
+    }
+
+    /// Опрос группы: несколько вариантов и закрыт ли (до подключения — канал узнает при догоне).
+    pub fn set_poll(&self, multiple: bool, closed: bool) {
+        let mut s = self.lock();
+        if let Some(p) = s.messages.iter_mut().find_map(|m| m.poll.as_mut()) {
+            p.multiple = multiple;
+            p.closed = closed;
+        }
+    }
+
+    /// Мои голоса в опросе группы (номера вариантов) и сколько у каждого.
+    pub fn poll_votes(&self) -> (Vec<usize>, Vec<i32>) {
+        let s = self.lock();
+        s.messages.iter().find_map(|m| m.poll.as_ref()).map(|p| (p.mine.clone(), p.answers.iter().map(|a| a.1).collect())).unwrap_or_default()
+    }
+
+    /// Номера сообщений с кнопками бота и с опросом.
+    pub fn bot_and_poll(&self) -> Option<(i32, i32)> {
+        let s = self.lock();
+        let bot = s.messages.iter().find(|m| m.markup.is_some())?.id;
+        let poll = s.messages.iter().find(|m| m.poll.is_some())?.id;
+        Some((bot, poll))
     }
 
     /// Папку удалили на другом устройстве.
@@ -1353,6 +1392,47 @@ impl FakeWire {
             s.messages.retain(|m| m.peer != p || !r.id.contains(&m.id));
             tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }.into()
         });
+        on!(f::messages::GetBotCallbackAnswer, |r| {
+            let p = Server::input_peer(&r.peer)?;
+            let m = s.find(p, r.msg_id).ok_or_else(|| rpc(400, "MESSAGE_ID_INVALID"))?;
+            if m.markup.is_none() {
+                return Err(rpc(400, "DATA_INVALID"));
+            }
+            let (message, alert) = match r.data.as_deref() {
+                Some(b"yes") => (Some(BOT_YES.to_owned()), false),
+                Some(b"no") => (Some(BOT_NO.to_owned()), true),
+                Some(b"hide") => (None, false),
+                _ => return Err(rpc(400, "DATA_INVALID")),
+            };
+            tl::types::messages::BotCallbackAnswer { alert, has_url: false, native_ui: false, message, url: None, cache_time: 0 }.into()
+        });
+        on!(f::messages::SendVote, |r| {
+            let p = Server::input_peer(&r.peer)?;
+            let m = s.messages.iter_mut().find(|m| m.peer == p && m.id == r.msg_id).ok_or_else(|| rpc(400, "MESSAGE_ID_INVALID"))?;
+            let poll = m.poll.as_mut().ok_or_else(|| rpc(400, "MESSAGE_ID_INVALID"))?;
+            if poll.closed {
+                return Err(rpc(400, "MESSAGE_POLL_CLOSED"));
+            }
+            if r.options.len() > 1 && !poll.multiple {
+                return Err(rpc(400, "OPTIONS_TOO_MUCH"));
+            }
+            let mut picks = Vec::new();
+            for o in &r.options {
+                let i = o.first().and_then(|b| b.checked_sub(b'0')).map(usize::from).filter(|i| *i < poll.answers.len());
+                picks.push(i.ok_or_else(|| rpc(400, "OPTION_INVALID"))?);
+            }
+            for i in std::mem::take(&mut poll.mine) {
+                poll.answers[i].1 -= 1;
+            }
+            for &i in &picks {
+                poll.answers[i].1 += 1;
+            }
+            poll.mine = picks;
+            let (results, poll_id, peer, id) = (poll.results(), poll.id, m.peer, m.id);
+            s.updates(vec![
+                tl::types::UpdateMessagePoll { peer: Some(peer.to_tl()), msg_id: Some(id), top_msg_id: None, poll_id, poll: None, results }.into(),
+            ])
+        });
         on!(f::messages::SendReaction, |r| {
             let p = Server::input_peer(&r.peer)?;
             let key = r
@@ -1598,6 +1678,30 @@ impl Script for FakeTelegram {
             Step::Gap,
             Step::Wait,
             Step::LinkDrop,
+        ]
+    }
+
+    /// Кнопки бота («Да» — ответ, «Нет» — предупреждение, «Справка» — ссылка, «Скрыть» — молча) и опрос группы
+    /// (голос, два варианта в опросе с одним, отзыв).
+    fn extra(&self) -> Vec<postman_core::channel::conformance::ExtraProbe> {
+        use crate::extra::{Button, ButtonAction as A, TgAct};
+        use postman_core::channel::ExtraReply;
+        use postman_core::channel::conformance::{ExtraExpect as E, ExtraProbe};
+        let Some((bot, poll)) = self.bot_and_poll() else { return Vec::new() };
+        let press = |action| TgAct::press(&Button { text: String::new(), action });
+        let vote = |o: &[&[u8]]| TgAct::Vote { options: o.iter().map(|x| x.to_vec()).collect() }.to_extra();
+        let at = |peer: Peer, id: i32, payload, expect| ExtraProbe { conversation: peer.conv(), message: crate::ids::msg_id(id), payload, expect };
+        let reply =
+            |text: Option<&str>, alert, url: Option<&str>| E::Reply(ExtraReply { text: text.map(str::to_owned), alert, url: url.map(str::to_owned) });
+        let (b, g) = (Peer::User(BOT), Peer::Chat(GROUP));
+        vec![
+            at(b, bot, press(A::Callback { data: b"yes".to_vec(), password: false }), reply(Some(BOT_YES), false, None)),
+            at(b, bot, press(A::Callback { data: b"no".to_vec(), password: false }), reply(Some(BOT_NO), true, None)),
+            at(b, bot, press(A::Url { url: HELP.into() }), reply(None, false, Some(HELP))),
+            at(b, bot, press(A::Callback { data: b"hide".to_vec(), password: false }), reply(None, false, None)),
+            at(g, poll, vote(&[b"0"]), E::Updated),
+            at(g, poll, vote(&[b"0", b"1"]), E::Refused),
+            at(g, poll, vote(&[]), E::Updated),
         ]
     }
 

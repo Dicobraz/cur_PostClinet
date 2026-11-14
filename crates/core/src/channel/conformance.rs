@@ -4,7 +4,8 @@
 //! [`run_all`] подключается к каналу и проверяет: вход, отказ чужой сессии, возможности сессии в пределах возможностей
 //! канала, первый догон (беседы, последние сообщения, курсор в конце), повтор пачки без записей, догон от курсора,
 //! историю, отправку без дублей по `client_id`, честность возможностей («нет у сервера» — `Unsupported`), правку,
-//! реакцию, удаление, загрузку и выгрузку, неизвестную беседу и весь поток учётки ([`super::run`]) с базой.
+//! реакцию, удаление, загрузку и выгрузку, неизвестную беседу, действия довеска ([`Action::Extra`]: пробы — от
+//! сценария, [`Script::extra`]; без флага `extra` — `Unsupported`) и весь поток учётки ([`super::run`]) с базой.
 //! События «от других» (правка, реакция, «прочитано», «печатает», удаление без беседы, `Gap`, `Wait`, обрыв связи)
 //! сервер показывает по сценарию ([`Script`]).
 //!
@@ -20,8 +21,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::{
     AccountId, Action, Answer, ChannelError, ChannelEvent, ChannelFeatures, ChannelId, ChannelPlugin, ChannelSession, ChannelState, ChannelStore,
-    ConnectCtx, ConversationId, Cursor, Done, FileMeta, FlowCtx, Limit, LocalStore, MemorySecrets, Message, MessageId, Outgoing, PluginStore, Prompt,
-    Reactions, Reader, Request, RunCtx, Secret, Secrets, Update, text_doc,
+    ConnectCtx, ConversationId, Cursor, Done, Extra, ExtraReply, FileMeta, FlowCtx, Limit, LocalStore, MemorySecrets, Message, MessageId, Outgoing,
+    PluginStore, Prompt, Reactions, Reader, Request, RunCtx, Secret, Secrets, Update, text_doc,
 };
 
 /// Что сервер канала показывает по сценарию: событие «от других» подключённым сессиям.
@@ -51,6 +52,31 @@ pub trait Script {
     fn steps(&self) -> Vec<Step>;
     /// Сыграть шаг: события — подключённым сессиям.
     fn play(&self, step: Step);
+    /// Пробы действий довеска (кнопки, голос): формат `payload` знает только канал. По умолчанию нет — проверка
+    /// `extra` у канала с флагом пропускается.
+    fn extra(&self) -> Vec<ExtraProbe> {
+        Vec::new()
+    }
+}
+
+/// Действие довеска для проверки и чего от него ждать.
+#[derive(Debug, Clone)]
+pub struct ExtraProbe {
+    pub conversation: ConversationId,
+    pub message: MessageId,
+    pub payload: Extra,
+    pub expect: ExtraExpect,
+}
+
+/// Чего ждать от [`ExtraProbe`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtraExpect {
+    /// Ответ канала — ровно этот ([`Done::Reply`]).
+    Reply(ExtraReply),
+    /// Принято; сообщение пришло заново событием `Messages` (итоги опроса).
+    Updated,
+    /// Отказ сервера (опрос закрыт, лишний вариант): ошибка, но не `Unsupported`.
+    Refused,
 }
 
 /// Что нужно проверкам.
@@ -207,6 +233,7 @@ async fn all(h: &Harness, report: &mut Report) {
     report.record("delete", check_delete(&mut conn, &seen).await);
     report.record("download", check_download(&mut conn, &seen).await);
     report.record("upload_and_send", check_upload(&mut conn, &seen).await);
+    report.record("extra", check_extra(h, &mut conn).await);
     if let Some(script) = h.script.clone() {
         let steps = script.steps();
         for (step, name) in [
@@ -460,6 +487,7 @@ async fn check_honest(conn: &mut Conn, seen: &Seen) -> Check {
         Action::SaveDraft { conversation: conv.clone(), draft: None },
         Action::Edit { conversation: conv.clone(), message: msg.clone(), body: text_doc("x"), mentions: Vec::new() },
         Action::Delete { conversation: conv.clone(), ids: Vec::new(), for_all: true },
+        Action::Extra { conversation: conv.clone(), message: msg.clone(), payload: Extra::default() },
     ];
     let mut tried = 0;
     for a in probes.into_iter().filter(|a| !f.allows(a)) {
@@ -587,6 +615,40 @@ async fn check_upload(conn: &mut Conn, seen: &Seen) -> Check {
     conn.session.download(&a.source, &mut sink).await.map_err(|e| format!("download uploaded: {e}"))?;
     ensure(sink.0 == bytes, || "downloaded bytes differ from uploaded".into())?;
     Ok(Some(()))
+}
+
+/// Действия довеска: без флага — `Unsupported`; с флагом — пробы сценария (ответ, новые итоги, отказ) и неизвестная
+/// беседа — `NotFound`.
+async fn check_extra(h: &Harness, conn: &mut Conn) -> Check {
+    if !conn.session.features().extra {
+        let a = Action::Extra { conversation: ConversationId::new("conformance-extra"), message: MessageId::new("1"), payload: Extra::default() };
+        return match conn.session.act(a).await {
+            Err(ChannelError::Unsupported) => Ok(Some(())),
+            other => Err(format!("extra is not in features, yet the channel answered {other:?}")),
+        };
+    }
+    let probes = h.script.as_ref().map(|s| s.extra()).unwrap_or_default();
+    let Some(first) = probes.first().cloned() else { return Ok(None) };
+    for p in probes {
+        conn.drain();
+        let a = Action::Extra { conversation: p.conversation.clone(), message: p.message.clone(), payload: p.payload.clone() };
+        match (&p.expect, conn.session.act(a).await) {
+            (ExtraExpect::Reply(want), Ok(Done::Reply(got))) if got == *want => {}
+            (ExtraExpect::Updated, Ok(Done::Ok | Done::Reply(_))) => {
+                let id = p.message.clone();
+                conn.until("extra: message again", |e| matches!(e, ChannelEvent::Messages { messages, .. } if messages.iter().any(|m| m.id == id)))
+                    .await?;
+            }
+            (ExtraExpect::Refused, Err(e)) if e != ChannelError::Unsupported => {}
+            (want, got) => return Err(format!("extra on {}: expected {want:?}, got {got:?}", p.message)),
+        }
+    }
+    let nobody =
+        Action::Extra { conversation: ConversationId::new("no-such-conversation-in-conformance"), message: first.message, payload: first.payload };
+    match conn.session.act(nobody).await {
+        Err(ChannelError::NotFound) => Ok(Some(())),
+        other => Err(format!("extra in unknown conversation: {other:?}, expected NotFound")),
+    }
 }
 
 async fn check_step(h: &Harness, conn: &mut Conn, script: &dyn Script, step: Step, seen: &Seen) -> Check {
@@ -762,6 +824,21 @@ async fn check_run(h: &Harness) -> Check {
             let u = update(&mut up, h.wait, "refused reaction", |u| matches!(u, Update::Acted { ticket: 2, .. })).await?;
             ensure(matches!(u, Update::Acted { result: Err(ChannelError::Unsupported), .. }), || format!("reaction without the feature: {u:?}"))?;
         }
+    }
+    // Действие довеска через поток: без флага — отказ без запроса к серверу; с флагом — ответ канала событием `Acted`.
+    let reply = h.script.iter().flat_map(|s| s.extra()).find_map(|p| match p.expect {
+        ExtraExpect::Reply(r) => Some((Action::Extra { conversation: p.conversation, message: p.message, payload: p.payload }, r)),
+        _ => None,
+    });
+    if !features.extra {
+        let a = Action::Extra { conversation: ConversationId::new("conformance-extra"), message: MessageId::new("1"), payload: Extra::default() };
+        let _ = req_tx.send(Request::Act { ticket: 3, action: a });
+        let u = update(&mut up, h.wait, "refused extra", |u| matches!(u, Update::Acted { ticket: 3, .. })).await?;
+        ensure(matches!(u, Update::Acted { result: Err(ChannelError::Unsupported), .. }), || format!("extra without the feature: {u:?}"))?;
+    } else if let Some((a, want)) = reply {
+        let _ = req_tx.send(Request::Act { ticket: 3, action: a });
+        let u = update(&mut up, h.wait, "extra reply", |u| matches!(u, Update::Acted { ticket: 3, .. })).await?;
+        ensure(matches!(&u, Update::Acted { result: Ok(Done::Reply(r)), .. } if *r == want), || format!("extra through the thread: {u:?}"))?;
     }
     let _ = req_tx.send(Request::SignOut);
     update(&mut up, h.wait, "signed out", |u| matches!(u, Update::SignedOut)).await?;

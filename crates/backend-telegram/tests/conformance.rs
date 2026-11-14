@@ -2,7 +2,8 @@
 //! сервере (`postman_backend_telegram::fake`): те же байты TL, без сети. Плюс то, чего общий набор не видит: вход по
 //! QR, неверный код и пароль, догон от курсора после пропуска, просроченная ссылка на файл, папки и архив; альбомы
 //! (отправка `sendMultiMedia`, приём `grouped_id`, поздняя часть, правка, удаление), кнопки бота и опрос в `extra`,
-//! папки по правилам «без заглушённых / прочитанного / архива» на лету.
+//! папки по правилам «без заглушённых / прочитанного / архива» на лету; нажатие кнопок бота и голос в опросе
+//! (`Action::Extra`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // интеграционный тест: «не падать» — для кода приложения (S2-03)
 
@@ -43,6 +44,7 @@ fn telegram_passes_conformance() {
     // Telegram умеет всё, что проверяется отказом: пропуск — только «честность возможностей».
     assert_eq!(report.skipped, ["features_are_honest"], "{report}");
     assert!(report.passed.len() >= 24, "{report}");
+    assert!(report.passed.contains(&"extra"), "кнопки бота и голос — через Action::Extra: {report}");
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -489,5 +491,71 @@ fn folders_follow_state() {
         server.remove_filter(fake::UNREAD);
         let evs = until(&mut c.rx, |e| matches!(e, ChannelEvent::Folders(_))).await;
         assert_eq!(folder(&evs), Some(None), "папки «Непрочитанное» нет");
+    });
+}
+
+/// Кнопки бота и голос (`Action::Extra`): кнопки берутся из довеска сообщения; ответ бота — `Done::Reply`, ссылка —
+/// без запроса; опрос с несколькими вариантами — два голоса, итоги заново; отзыв; закрытый опрос — отказ сервера.
+#[test]
+fn bot_buttons_and_votes() {
+    use postman_backend_telegram::extra::TgAct;
+    use postman_core::channel::ExtraReply;
+
+    let server = FakeTelegram::new();
+    server.set_poll(true, false);
+    let plugin = TelegramChannel::with_dial(Arc::new(server.clone()));
+    let cache = Cache::open_in_memory().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt(), async {
+        let mut c = connect(&plugin, &cache).await;
+        c.session.catch_up(None).await.unwrap();
+        let all = messages(&until(&mut c.rx, |e| matches!(e, ChannelEvent::Cursor(_))).await);
+        let (bot, group) = (conv(Peer::User(fake::BOT)), conv(Peer::Chat(fake::GROUP)));
+        let (_, bm) = all.iter().find(|(c, m)| *c == bot && TgExtra::of(&m.extra).keyboard.is_some()).unwrap();
+        let kb = TgExtra::of(&bm.extra).keyboard.unwrap();
+        let act = |conversation: &ConversationId, message: &MessageId, payload| Action::Extra {
+            conversation: conversation.clone(),
+            message: message.clone(),
+            payload,
+        };
+
+        let yes = c.session.act(act(&bot, &bm.id, TgAct::press(&kb.rows[0][0]))).await.unwrap();
+        assert_eq!(yes, Done::Reply(ExtraReply { text: Some(fake::BOT_YES.into()), alert: false, url: None }));
+        let no = c.session.act(act(&bot, &bm.id, TgAct::press(&kb.rows[0][1]))).await.unwrap();
+        assert_eq!(no, Done::Reply(ExtraReply { text: Some(fake::BOT_NO.into()), alert: true, url: None }), "предупреждением");
+        let help = c.session.act(act(&bot, &bm.id, TgAct::press(&kb.rows[1][0]))).await.unwrap();
+        assert_eq!(help, Done::Reply(ExtraReply { url: Some(fake::HELP.into()), ..ExtraReply::default() }), "ссылка — открыть по нажатию");
+        let hide = c.session.act(act(&bot, &bm.id, TgAct::press(&kb.rows[1][1]))).await.unwrap();
+        assert_eq!(hide, Done::Reply(ExtraReply::default()), "принято молча");
+        let r = c.session.act(act(&ConversationId::new("u42"), &bm.id, TgAct::press(&kb.rows[0][0]))).await;
+        assert!(matches!(r, Err(ChannelError::NotFound)), "{r:?}");
+        let r = c.session.act(act(&bot, &bm.id, postman_core::channel::Extra(b"junk".to_vec()))).await;
+        assert!(matches!(r, Err(ChannelError::Protocol(_))), "{r:?}");
+
+        // Опрос с несколькими вариантами: два голоса — итоги тем же сообщением заново.
+        let (_, pm) = all.iter().find(|(c, m)| *c == group && TgExtra::of(&m.extra).poll.is_some()).unwrap();
+        let poll = TgExtra::of(&pm.extra).poll.unwrap();
+        assert!(poll.multiple);
+        let both: Vec<_> = poll.answers.iter().collect();
+        assert_eq!(c.session.act(act(&group, &pm.id, TgAct::vote(&both))).await.unwrap(), Done::Ok);
+        assert_eq!(server.poll_votes(), (vec![0, 1], vec![2, 2]));
+        let evs = until(&mut c.rx, |e| matches!(e, ChannelEvent::Messages { messages, .. } if messages.iter().any(|m| m.id == pm.id))).await;
+        let (_, m) = messages(&evs).pop().unwrap();
+        let p = TgExtra::of(&m.extra).poll.unwrap();
+        assert!(p.answers.iter().all(|a| a.chosen), "{p:?}");
+        assert_eq!(p.total, Some(4));
+
+        // Отзыв голоса.
+        assert_eq!(c.session.act(act(&group, &pm.id, TgAct::vote(&[]))).await.unwrap(), Done::Ok);
+        assert_eq!(server.poll_votes(), (vec![], vec![1, 1]));
+        let evs = until(&mut c.rx, |e| matches!(e, ChannelEvent::Messages { messages, .. } if messages.iter().any(|m| m.id == pm.id))).await;
+        let (_, m) = messages(&evs).pop().unwrap();
+        assert!(!TgExtra::of(&m.extra).poll.unwrap().voted());
+
+        // Опрос закрыли на сервере — отказ сервера, голоса прежние.
+        server.set_poll(true, true);
+        let r = c.session.act(act(&group, &pm.id, TgAct::vote(&both[..1]))).await;
+        assert!(matches!(&r, Err(ChannelError::Denied(e)) if e == "MESSAGE_POLL_CLOSED"), "{r:?}");
+        assert_eq!(server.poll_votes(), (vec![], vec![1, 1]));
     });
 }

@@ -20,13 +20,13 @@ use grammers_tl_types as tl;
 use postman_core::backend::BoxFuture;
 use postman_core::channel::{
     AccountId, Action, Address, AttachmentKind, AttachmentSource, ByteSink, ByteSource, ChannelError, ChannelEvent, ChannelFeatures, ChannelFolder,
-    ChannelId, ChannelSession, ChannelState, Conversation, ConversationId, Counts, Cursor, Done, FileMeta, Flow, FlowKind, FolderRef, Incoming,
-    Member, Message, MessageId, Outgoing, Page, Participant, ParticipantId, PluginStore, Reader, Role, Uploaded,
+    ChannelId, ChannelSession, ChannelState, Conversation, ConversationId, Counts, Cursor, Done, Extra, ExtraReply, FileMeta, Flow, FlowKind,
+    FolderRef, Incoming, Member, Message, MessageId, Outgoing, Page, Participant, ParticipantId, PluginStore, Reader, Role, Uploaded,
 };
 use postman_ir::{Align, Block, Document, Inline};
 
 use crate::convert::{self, Ctx, Kindly, Source, UpFile};
-use crate::extra::{self, TgExtra};
+use crate::extra::{self, ButtonAction, TgAct, TgExtra};
 use crate::ids::{Peer, PeerBook, msg_id, parse_msg, user_of};
 use crate::text;
 use crate::vault::UpdState;
@@ -1584,9 +1584,44 @@ impl Inner {
             Action::Start { with } => self.start(with).await,
             Action::Members { conversation } => self.members(&conversation).await,
             Action::Resolve { link } => self.resolve(&link).await,
+            Action::Extra { conversation, message, payload } => self.extra_act(&conversation, &message, &payload).await,
+            _ => Err(ChannelError::Unsupported),
         };
         self.check_secret();
         r
+    }
+
+    /// Действие довеска (`Action::Extra`): кнопка бота — `getBotCallbackAnswer` (ответ: текст, предупреждение,
+    /// ссылка), кнопка-ссылка — ссылкой без запроса; голос — `sendVote` (итоги — `updateMessagePoll` в ответе и в
+    /// потоке). В журнал — ни данных кнопки, ни ответа бота.
+    async fn extra_act(&self, conv: &ConversationId, message: &MessageId, payload: &Extra) -> Result<Done, ChannelError> {
+        let (_, ip) = self.peer_of(conv)?;
+        let msg = parse_msg(message).ok_or(ChannelError::NotFound)?;
+        let act = TgAct::parse(payload).ok_or_else(|| ChannelError::Protocol("extra payload".into()))?;
+        match act {
+            TgAct::Press { action: ButtonAction::Url { url } | ButtonAction::LoginUrl { url } } => {
+                Ok(Done::Reply(ExtraReply { url: Some(url), ..ExtraReply::default() }))
+            }
+            // Пароль двухэтапной проверки боту (передача бота) — не из Postman.
+            TgAct::Press { action: ButtonAction::Callback { password: true, .. } } => Err(ChannelError::Unsupported),
+            TgAct::Press { action: ButtonAction::Callback { data, .. } } => {
+                let req = tl::functions::messages::GetBotCallbackAnswer { game: false, peer: ip, msg_id: msg, data: Some(data), password: None };
+                let tl::enums::messages::BotCallbackAnswer::Answer(a) = call(&*self.wire, &req).await?;
+                tracing::debug!(alert = a.alert, text = a.message.is_some(), url = a.url.is_some(), "telegram: bot callback answered");
+                Ok(Done::Reply(ExtraReply { text: a.message.filter(|t| !t.is_empty()), alert: a.alert, url: a.url }))
+            }
+            // Остальные кнопки (клавиатура бота, мини-приложения, игры, оплата) — у вида беседы или на телефоне.
+            TgAct::Press { .. } => Err(ChannelError::Unsupported),
+            TgAct::Vote { options } => {
+                let known = self.polls.borrow().iter().find(|(_, (c, m))| c == conv && m.id == *message).map(|(_, (_, m))| m.extra.clone());
+                if let Some(poll) = known.and_then(|e| TgExtra::of(&e).poll) {
+                    poll.check_vote(&options).map_err(|e| ChannelError::Denied(e.into()))?;
+                }
+                let u = call(&*self.wire, &tl::functions::messages::SendVote { peer: ip, msg_id: msg, options }).await?;
+                self.absorb(u, None);
+                Ok(Done::Ok)
+            }
+        }
     }
 
     fn patch(&self, conv: &ConversationId, f: impl FnOnce(&mut Conversation)) {

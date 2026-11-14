@@ -71,7 +71,14 @@ impl WireError {
                     | "CHAT_SEND_MEDIA_FORBIDDEN"
                     | "CHAT_RESTRICTED"
                     | "USER_RESTRICTED"
-                    | "REACTION_INVALID" => ChannelError::Denied(name),
+                    | "REACTION_INVALID"
+                    // Голос и кнопки бота: опрос закрыт, лишний или чужой вариант, переголосовать нельзя, бот молчит.
+                    | "MESSAGE_POLL_CLOSED"
+                    | "OPTIONS_TOO_MUCH"
+                    | "OPTION_INVALID"
+                    | "REVOTE_NOT_ALLOWED"
+                    | "BOT_RESPONSE_TIMEOUT"
+                    | "DATA_INVALID" => ChannelError::Denied(name),
                     "PEER_ID_INVALID"
                     | "CHANNEL_INVALID"
                     | "CHANNEL_PRIVATE"

@@ -30,13 +30,22 @@ fn demo_channel_passes_conformance() {
     // Пропуск — только проверка отказов: всё умеющему каналу отказывать не в чем.
     assert_eq!(report.skipped, ["features_are_honest"], "всё умеющий канал проходит все проверки: {report}");
     assert!(report.passed.len() >= 24, "{report}");
+    assert!(report.passed.contains(&"extra"), "кнопки бота и опрос — через Action::Extra: {report}");
 }
 
-/// Канал без реакций, правки, удаления у всех и «печатает»: отказы `Unsupported`, проверки этих умений пропущены.
+/// Канал без реакций, правки, удаления у всех, «печатает» и действий довеска: отказы `Unsupported`, проверки этих
+/// умений пропущены.
 #[test]
 fn limited_demo_channel_is_honest() {
-    let f =
-        ChannelFeatures { edit: Limit::No, delete_for_all: Limit::No, reactions: Reactions::No, typing: false, server_mute: false, ..all_features() };
+    let f = ChannelFeatures {
+        edit: Limit::No,
+        delete_for_all: Limit::No,
+        reactions: Reactions::No,
+        typing: false,
+        server_mute: false,
+        extra: false,
+        ..all_features()
+    };
     let server = DemoServer::with_features(f.clone());
     let mut h = harness(server);
     h.script = None;
@@ -44,6 +53,7 @@ fn limited_demo_channel_is_honest() {
     let report = run_all(&h);
     assert!(report.ok(), "{report}");
     assert!(report.passed.contains(&"features_are_honest"), "{report}");
+    assert!(report.passed.contains(&"extra"), "без флага — действие довеска отклонено: {report}");
     for skipped in ["edit", "react"] {
         assert!(report.skipped.contains(&skipped), "{skipped}: {report}");
     }

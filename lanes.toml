@@ -23,8 +23,8 @@ paths = ["crates/cache/*", "crates/search/*"]
 paths = ["crates/compose/*", "crates/calendar/*", "crates/export/*"]
 
 [lane.sandbox]
-# L1: воркер-песочница и S/MIME (CODEOWNERS — класс B).
-paths = ["crates/worker/*", "crates/smime/*"]
+# L1: механизм процессов и песочница (`postman-proc`), воркер и S/MIME (CODEOWNERS — класс B).
+paths = ["crates/proc/*", "crates/worker/*", "crates/smime/*"]
 
 [lane.core]
 # L2: модель, договор плагинов, синхронизация.

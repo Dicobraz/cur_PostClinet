@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 zeroize = "1"
+# Запуск в песочнице, кадры, журнал, сторож — общий механизм процессов (ADR 0013).
+postman-proc.workspace = true
 postman-ir.workspace = true
 # Проверка подписи S/MIME (S5-12): разбор CMS и цепочка — только здесь, в песочнице.
 postman-smime.workspace = true
@@ -48,24 +50,6 @@ name = "postman-viewer"
 path = "src/bin/postman-viewer.rs"
 required-features = ["viewer"]
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-landlock = "0.4"
-seccompiler = "0.5"
-
-[target.'cfg(windows)'.dependencies.windows-sys]
-version = "0.61"
-features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Isolation",
-    "Win32_System_JobObjects",
-    "Win32_System_Pipes",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
-]
-
 # Версия exe (build.rs, rc.exe из Windows SDK).
 [build-dependencies]
 embed-resource = "3"
@@ -75,6 +59,10 @@ tempfile = "3"
 # Тесты хоста модулей (tests/viewer.rs) и сборка `postman-viewer.exe` к ним: признак `viewer` у себя.
 postman-worker = { path = ".", features = ["viewer"] }
 postman-smime = { workspace = true, features = ["testkit"] }
+
+# Пробы песочницы (tests/linux_probe.rs): дескрипторы и версия Landlock напрямую.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

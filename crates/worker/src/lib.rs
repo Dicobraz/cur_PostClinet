@@ -15,34 +15,35 @@ pub use ics::Cut;
 pub mod mapi;
 pub mod mime;
 pub mod preview;
-mod sandbox;
 pub mod smime;
 pub mod wasm;
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use postman_ir::Document;
 use postman_smime::envelope::{Envelope, OpenError, Opened};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-pub use preview::{Entry, Listing, OfficeFormat, OfficeScan, Preview, PreviewKind, Section, SectionTitle};
+use postman_proc::frame::{MAX_FRAME, read_frame, write_msg};
+pub use postman_proc::journal::{Journal, JournalLevel, STDERR_LINE, STDERR_RATE, set_default_journal};
+use postman_proc::journal::{default_journal, drain_stderr};
 /// Распределитель с пределом кучи для `#[global_allocator]` процессов песочницы на macOS (MAC-03): `RLIMIT_AS` там не
 /// действует. Приложению и тестам не нужен.
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
-pub use sandbox::Limited;
-pub use sandbox::{Level, Namespaces};
-
-/// Код выхода воркера, которого остановил сторож времени: разбор одного запроса дольше [`TIME_LIMIT`].
-pub const EXIT_TIME: i32 = 5;
-/// Код выхода процесса песочницы сверх предела памяти (macOS: распределитель `Limited`; на Windows предел ставит Job
-/// Object, на Linux — `RLIMIT_AS`: отказ в памяти там — аварийное завершение, `SIGABRT`).
-pub const EXIT_MEMORY: i32 = 6;
+pub use postman_proc::sandbox::Limited;
+use postman_proc::sandbox::{self, Launch, Profile};
+/// Коды выхода процесса песочницы: [`EXIT_TIME`] — сторож времени остановил запрос дольше [`TIME_LIMIT`];
+/// [`EXIT_MEMORY`] — предел памяти (macOS: распределитель `Limited`; на Windows предел ставит Job Object, на Linux —
+/// `RLIMIT_AS`: отказ в памяти там — аварийное завершение, `SIGABRT`).
+pub use postman_proc::{EXIT_MEMORY, EXIT_TIME, Level, Namespaces};
+use postman_proc::{SANDBOX_REFUSAL, exit_name, watchdog};
+pub use preview::{Entry, Listing, OfficeFormat, OfficeScan, Preview, PreviewKind, Section, SectionTitle};
 /// Предел времени на один запрос внутри воркера (сторож в [`serve`]); клиент ждёт чуть дольше.
 pub const TIME_LIMIT: Duration = Duration::from_secs(8);
 /// Сколько клиент ждёт ответа на просмотр вложения: сторож воркера срабатывает раньше.
@@ -53,8 +54,6 @@ pub const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Сколько клиент ждёт разбора календаря (до [`MAX_ICS`]): сторож воркера срабатывает раньше.
 pub const ICS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Больше этого не принимаем ни в одну сторону (кроме бинарной части `MimeSplit`).
-const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Бинарная часть запроса и ответа `MimeSplit` и `Mapi`: письмо целиком и его раскодированные части.
 const MAX_SPLIT_FRAME: usize = mime::MAX_SPLIT;
 
@@ -716,32 +715,6 @@ fn max_bin(req: &Request) -> usize {
     }
 }
 
-fn write_msg(w: &mut impl Write, json: &[u8], bin: &[u8], max_bin: usize) -> io::Result<()> {
-    write_frame(w, json, MAX_FRAME)?;
-    write_frame(w, bin, max_bin)
-}
-
-fn write_frame(w: &mut impl Write, payload: &[u8], max: usize) -> io::Result<()> {
-    if payload.len() > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "кадр слишком большой"));
-    }
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
-    w.write_all(payload)?;
-    w.flush()
-}
-
-fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "кадр слишком большой"));
-    }
-    let mut buf = vec![0; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
 /// Удалить след песочницы на диске (Windows: профиль AppContainer; ADR 0011, PAR-05) — действие
 /// `postman-worker --remove-appcontainer` при удалении Postman. Следа нет — успех.
 pub fn remove_appcontainer() -> Result<(), String> {
@@ -758,11 +731,11 @@ pub(crate) fn run(limit: Duration, handle: impl Fn(Result<Request, serde_json::E
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     // Шаг, которому нужен однопоточный процесс (Linux: namespaces), — до сторожа.
-    let isolated = sandbox::isolate();
+    let isolated = sandbox::isolate(Profile::Sealed);
     // Сторож времени — до запирания (потом новые потоки могут быть запрещены): запрос дольше `limit`
     // завершает процесс; клиент видит код `EXIT_TIME` и поднимает новый процесс.
-    let watchdog = watchdog(limit);
-    if let Err(e) = isolated.and_then(|()| sandbox::lockdown()) {
+    let watchdog = watchdog(Some(limit));
+    if let Err(e) = isolated.and_then(|()| sandbox::lockdown(Profile::Sealed)) {
         // Без песочницы не работаем: лучше показать письмо текстом, чем разбирать HTML без защиты.
         let json = serde_json::to_vec(&Response::Err(format!("{SANDBOX_REFUSAL}{e}"))).unwrap_or_default();
         let _ = write_msg(&mut stdout, &json, &[], MAX_FRAME);
@@ -911,172 +884,6 @@ fn handle(req: Result<Request, serde_json::Error>, bin: &[u8]) -> (Response, Vec
     (resp, out_bin)
 }
 
-/// Поток-сторож: `true` — запрос начат, `false` — закончен. Не закончен за `limit` — выход с [`EXIT_TIME`].
-/// В простое поток спит в `recv` и процессор не тратит. Поток не запустился — работаем без сторожа (клиент всё
-/// равно убьёт воркер по своему таймауту).
-/// Тот же поток следит за клиентом (SBX-03, аудит №44): клиент умер (сменился родитель) — выход не позже
-/// [`PARENT_POLL`], на всех ОС одинаково (на Windows процесс к тому же в Job Object с `KILL_ON_JOB_CLOSE`).
-fn watchdog(limit: Duration) -> Option<mpsc::Sender<bool>> {
-    let (tx, rx) = mpsc::channel::<bool>();
-    let parent = sandbox::parent();
-    let spawned = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
-        let mut started: Option<Instant> = None;
-        loop {
-            match rx.recv_timeout(PARENT_POLL) {
-                Ok(true) => started = Some(Instant::now()),
-                Ok(false) => started = None,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if sandbox::parent() != parent {
-                std::process::exit(0);
-            }
-            if started.is_some_and(|t| t.elapsed() >= limit) {
-                std::process::exit(EXIT_TIME);
-            }
-        }
-    });
-    spawned.ok().map(|_| tx)
-}
-
-/// Как часто процесс песочницы проверяет, жив ли клиент.
-const PARENT_POLL: Duration = Duration::from_millis(250);
-
-/// Начало ответа процесса, отказавшего в запирании (до первого запроса, выход 3).
-const SANDBOX_REFUSAL: &str = "песочница: ";
-
-/// Приёмник строк журнала процесса песочницы ([`Client::journal`]).
-pub type Journal = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Наибольшая длина строки stderr процесса песочницы в журнале, байт; длиннее — обрезается с пометкой.
-pub const STDERR_LINE: usize = 2048;
-/// Наибольшее число строк stderr процесса песочницы в журнале за секунду; сверх — одна строка WARN за секунду.
-pub const STDERR_RATE: u32 = 100;
-
-/// Важность строки stderr процесса песочницы для журнала приложения (`pets-shell/LOGGING.md`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JournalLevel {
-    /// Паника, отказ в памяти: разбор не состоялся.
-    Error,
-    /// Остальное: процесс песочницы пишет в stderr только о необычном (запасной путь, предел частоты строк).
-    Warn,
-}
-
-impl JournalLevel {
-    /// Важность строки по её началу: строки процесса — `WARN …`, паника std — `thread '…' panicked at`, отказ в памяти —
-    /// `memory allocation of … failed`.
-    pub fn of(line: &str) -> Self {
-        if line.contains("panicked at") || line.starts_with("memory allocation of ") || line.contains("memory limit exceeded") {
-            Self::Error
-        } else {
-            Self::Warn
-        }
-    }
-}
-
-/// Приёмник журнала по умолчанию для всех клиентов процесса ([`set_default_journal`]).
-static DEFAULT_JOURNAL: std::sync::OnceLock<Journal> = std::sync::OnceLock::new();
-
-/// Куда писать строки stderr процессов песочницы всем клиентам, у которых не задан свой [`Client::journal`]: приложение
-/// ставит один раз при запуске (журнал `tracing`). Второй вызов не меняет приёмник; `false` — уже был задан.
-pub fn set_default_journal(sink: impl Fn(JournalLevel, &str) + Send + Sync + 'static) -> bool {
-    DEFAULT_JOURNAL.set(Arc::new(move |line: &str| sink(JournalLevel::of(line), line))).is_ok()
-}
-
-fn default_journal(line: &str) {
-    if let Some(sink) = DEFAULT_JOURNAL.get() {
-        return sink(line);
-    }
-    // Без приёмника приложения — его stderr (в файл его направляет приложение); строка уже ограничена по длине.
-    let _ = writeln!(io::stderr().lock(), "worker: {line}");
-}
-
-/// Ограничитель строк журнала: длина — [`STDERR_LINE`], частота — [`STDERR_RATE`] в секунду; первая лишняя строка
-/// за секунду заменяется одной строкой WARN, остальные до конца секунды отбрасываются.
-struct StderrLog {
-    journal: Journal,
-    window: Instant,
-    lines: u32,
-}
-
-impl StderrLog {
-    fn line(&mut self, bytes: &[u8], cut: bool) {
-        if self.window.elapsed() >= Duration::from_secs(1) {
-            self.window = Instant::now();
-            self.lines = 0;
-        }
-        self.lines = self.lines.saturating_add(1);
-        if self.lines > STDERR_RATE {
-            if self.lines == STDERR_RATE + 1 {
-                (self.journal)(&format!("WARN stderr rate limit: over {STDERR_RATE} lines/s, dropping the rest of this second"));
-            }
-            return;
-        }
-        let text = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
-        if cut { (self.journal)(&format!("{text} [line truncated]")) } else { (self.journal)(&text) }
-    }
-}
-
-/// Фоновое чтение stderr процесса песочницы до его закрытия: канал не переполняется (процесс не встанет на записи),
-/// UI не ждёт. Строки — в `journal` с ограничением [`StderrLog`].
-/// Строка, которую std пишет в stderr перед аварийным завершением при отказе в памяти (все ОС): по ней клиент называет
-/// исход «превышен предел памяти» одинаково везде (SBX-03, аудит №45).
-const OOM_LINE: &[u8] = b"memory allocation of ";
-
-fn drain_stderr(mut stderr: Box<dyn Read + Send>, journal: Journal, oom: Arc<AtomicBool>) -> io::Result<()> {
-    std::thread::Builder::new()
-        .name("worker-stderr".into())
-        .spawn(move || {
-            let mut log = StderrLog { journal, window: Instant::now(), lines: 0 };
-            let mut buf = [0u8; 4096];
-            let mut line = Vec::with_capacity(256);
-            let mut cut = false;
-            loop {
-                let n = match stderr.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                for part in buf[..n].split_inclusive(|&b| b == b'\n') {
-                    let (body, end) = match part.strip_suffix(b"\n") {
-                        Some(body) => (body, true),
-                        None => (part, false),
-                    };
-                    let room = STDERR_LINE.saturating_sub(line.len());
-                    line.extend_from_slice(&body[..body.len().min(room)]);
-                    cut |= body.len() > room;
-                    if end {
-                        if line.starts_with(OOM_LINE) && line.ends_with(b" failed") {
-                            oom.store(true, Ordering::SeqCst);
-                        }
-                        log.line(&line, cut);
-                        line.clear();
-                        cut = false;
-                    }
-                }
-            }
-            if !line.is_empty() {
-                log.line(&line, cut);
-            }
-        })
-        .map(drop)
-}
-
-/// Запущенный процесс-воркер, как его видит клиент.
-pub(crate) struct Process {
-    pub stdin: Box<dyn Write + Send>,
-    pub stdout: Box<dyn Read + Send>,
-    /// Журнал процесса — канал на всех ОС (SBX-01); клиент читает его в фоне ([`drain_stderr`]).
-    pub stderr: Box<dyn Read + Send>,
-    pub kill: Box<dyn FnMut() + Send>,
-    /// Код завершения, если процесс уже завершился (для текста ошибки).
-    pub exit_code: Box<dyn FnMut() -> Option<u32> + Send>,
-    pub level: Level,
-    /// Почему изоляция не полная (Windows: отказ AppContainer) — для журнала и текста падения тестов.
-    pub fallback: Option<String>,
-}
-
 struct Running {
     stdin: Box<dyn Write + Send>,
     responses: mpsc::Receiver<io::Result<(Vec<u8>, Vec<u8>)>>,
@@ -1111,7 +918,6 @@ pub struct Client {
     /// Куда идут строки stderr процесса ([`Client::journal`]).
     journal: Journal,
     /// Режим namespaces процесса песочницы (Linux).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     namespaces: Namespaces,
 }
 
@@ -1619,10 +1425,7 @@ impl Client {
     }
 
     fn start(&mut self) -> Result<Running, String> {
-        #[cfg(target_os = "linux")]
-        let p = sandbox::spawn(&self.exe, self.memory, self.namespaces);
-        #[cfg(not(target_os = "linux"))]
-        let p = sandbox::spawn(&self.exe, self.memory);
+        let p = sandbox::spawn(&Launch { memory: self.memory, namespaces: self.namespaces, ..Launch::sealed(&self.exe) });
         let p = p.map_err(|e| format!("запуск {}: {e}", self.exe.display()))?;
         self.level = p.level;
         match (p.level, p.fallback) {
@@ -1665,32 +1468,6 @@ fn open_request(raw: &[u8], cek: &[u8], trust: &postman_smime::Trust) -> Result<
         return Err(SmimeFailure::TooLarge);
     }
     Ok(bin)
-}
-
-/// Код завершения с расшифровкой своих кодов, частых NTSTATUS и сигналов (Unix: 128 + номер).
-fn exit_name(code: u32) -> String {
-    let name = match code {
-        // `EXIT_TIME`, `EXIT_MEMORY`.
-        5 => " (превышено время разбора)",
-        6 => " (превышен предел памяти)",
-        134 if cfg!(unix) => " (аварийное завершение, SIGABRT)",
-        137 if cfg!(unix) => " (убит, SIGKILL)",
-        138 | 139 if cfg!(unix) => " (нарушение доступа к памяти)",
-        153 if cfg!(target_os = "linux") => " (запись в файл запрещена, SIGXFSZ)",
-        159 if cfg!(target_os = "linux") => " (запрещённый системный вызов, seccomp)",
-        0xC000_0005 => " (нарушение доступа к памяти)",
-        0xC000_0022 => " (нет доступа — вероятно, AppContainer не может прочитать файлы воркера)",
-        0xC000_0135 => " (не найдена DLL)",
-        0xC000_0139 => " (не найдена точка входа DLL)",
-        0xC000_0142 => " (ошибка инициализации DLL)",
-        0xC000_0409 => " (аварийное завершение / fail-fast)",
-        0xC000_0602 => " (fail-fast)",
-        0xC000_0374 => " (повреждение кучи)",
-        0xC000_00FD => " (переполнение стека)",
-        0xC000_0017 | 0xC000_012D => " (не хватило памяти)",
-        _ => "",
-    };
-    if code > 0xFFFF { format!("0x{code:08X}{name}") } else { format!("{code}{name}") }
 }
 
 #[cfg(test)]

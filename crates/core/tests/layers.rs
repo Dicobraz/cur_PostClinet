@@ -30,6 +30,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("postman-calendar", L1),
     ("postman-search", L1),
     ("postman-export", L1),
+    ("postman-proc", L1),
     ("postman-worker", L1),
     ("postman-core", L2),
     ("postman-demo", L2),

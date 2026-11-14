@@ -1,0 +1,45 @@
+[package]
+name = "postman-proc"
+description = "Общий механизм дочерних процессов: запуск в песочнице, кадры, журнал, сторож, двусторонняя связь (ADR 0013)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+# Кодек сообщений связи (ADR 0013): тот же, что у `cache` и ответа модулей просмотра.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+[features]
+# Процесс проверок песочницы для тестов (`tests/network.rs`); в поставку не входит.
+probe = []
+
+[[bin]]
+name = "postman-proc-probe"
+path = "src/bin/postman-proc-probe.rs"
+required-features = ["probe"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+landlock = "0.4"
+seccompiler = "0.5"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Isolation",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+]
+
+[dev-dependencies]
+# Сборка `postman-proc-probe` к тестам: признак `probe` у себя.
+postman-proc = { path = ".", features = ["probe"] }
+
+[lints]
+workspace = true

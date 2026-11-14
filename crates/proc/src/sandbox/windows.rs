@@ -21,7 +21,10 @@ use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName};
-use windows_sys::Win32::Security::{FreeSid, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
+use windows_sys::Win32::Security::{
+    CreateWellKnownSid, FreeSid, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, WELL_KNOWN_SID_TYPE,
+    WinCapabilityEnterpriseAuthenticationSid, WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -30,10 +33,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessMitigationPolicy, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
-    ProcessDynamicCodePolicy, ProcessSystemCallDisablePolicy, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, SetProcessMitigationPolicy,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessMitigationPolicy, IDLE_PRIORITY_CLASS, InitializeProcThreadAttributeList, NORMAL_PRIORITY_CLASS,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ProcessDynamicCodePolicy, ProcessSystemCallDisablePolicy, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, SetPriorityClass, SetProcessMitigationPolicy, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 use windows_sys::Win32::System::SystemServices::{
@@ -41,12 +45,14 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
 
-use super::Level;
+use super::{Launch, Level, Profile};
 use crate::Process;
 
 const PROFILE: &str = "Postman.MailWorker";
+/// Профиль AppContainer процессов «сеть без файлов» (ADR 0013): отдельный от воркера — права сети даются только ему.
+const NETWORK_PROFILE: &str = "Postman.Plugins";
 /// Предел памяти воркера; у хоста модулей — свой (`wasm::JOB_MEMORY`).
-pub(crate) const MEMORY_LIMIT: usize = 1 << 30;
+pub const MEMORY_LIMIT: usize = 1 << 30;
 
 // PROCESS_CREATION_MITIGATION_POLICY_* (winbase.h), значения *_ALWAYS_ON.
 const DEP_ENABLE: u64 = 0x01;
@@ -136,13 +142,14 @@ fn wide(s: &str) -> Vec<u16> {
 /// `memory` — предел памяти процесса (Job Object). Без AppContainer воркер не запускается (SBX-02): без него у процесса
 /// были бы файлы профиля и сеть, а закрыть сеть иначе можно только WFP с правами администратора. Клиент показывает
 /// письмо текстом с причиной.
-pub(crate) fn spawn(exe: &Path, memory: usize) -> io::Result<Process> {
+pub fn spawn(launch: &Launch) -> io::Result<Process> {
+    launch.check_args()?;
     if dropped("appcontainer") {
-        return partial(exe, "POSTMAN_SANDBOX_DROP=appcontainer".into(), memory);
+        return partial(launch, "POSTMAN_SANDBOX_DROP=appcontainer".into());
     }
     let refuse = |why: String| io::Error::other(format!("песочница: {why}"));
-    let sid = app_container_sid().map_err(|hr| refuse(format!("профиль AppContainer: HRESULT 0x{hr:08X}")))?;
-    let mut p = create_in_container(exe, &sid, memory).map_err(|e| refuse(format!("запуск в AppContainer: {e}")))?;
+    let sid = app_container_sid(launch.profile).map_err(|hr| refuse(format!("профиль AppContainer: HRESULT 0x{hr:08X}")))?;
+    let mut p = create_in_container(launch, &sid).map_err(|e| refuse(format!("запуск в AppContainer: {e}")))?;
     p.level = Level::Full;
     Ok(p)
 }
@@ -159,11 +166,11 @@ const CONTAINER_STEP: std::time::Duration = std::time::Duration::from_millis(20)
 /// контейнера, удерживаемый родителем, окно не закрывают. Ошибка временная и не наша — повторяем до [`CONTAINER_WAIT`],
 /// прежде чем уйти в частичную изоляцию (с повтором — 0 из 40 параллельных прогонов). Так же повторяем
 /// ERROR_GEN_FAILURE (31): та же гонка на runner CI (`verdicts_through_the_sandbox`, #88).
-fn create_in_container(exe: &Path, sid: &Sid, memory: usize) -> io::Result<Process> {
+fn create_in_container(launch: &Launch, sid: &Sid) -> io::Result<Process> {
     let start = std::time::Instant::now();
     let mut attempt = 1u32;
     loop {
-        match create(exe, Some(sid.0), memory) {
+        match create(launch, Some(sid.0)) {
             Err(e) if start.elapsed() < CONTAINER_WAIT && matches!(e.raw_os_error(), Some(2 | 3 | 31)) => {
                 std::thread::sleep(CONTAINER_STEP);
                 attempt += 1;
@@ -176,8 +183,8 @@ fn create_in_container(exe: &Path, sid: &Sid, memory: usize) -> io::Result<Proce
 
 /// Запуск без AppContainer с остальными ограничениями; `reason` — почему.
 /// Только отладочная диагностика (`POSTMAN_SANDBOX_DROP=appcontainer`): без AppContainer, уровень `Partial`.
-fn partial(exe: &Path, reason: String, memory: usize) -> io::Result<Process> {
-    let mut p = create(exe, None, memory)?;
+fn partial(launch: &Launch, reason: String) -> io::Result<Process> {
+    let mut p = create(launch, None)?;
     p.fallback = Some(reason);
     Ok(p)
 }
@@ -216,9 +223,11 @@ impl Drop for Sid {
 }
 
 /// SID профиля AppContainer воркера (создаётся при первом запуске); ошибка — HRESULT.
-fn app_container_sid() -> Result<Sid, u32> {
-    let name = wide(PROFILE);
-    let display = wide("Postman: разбор писем");
+fn app_container_sid(profile: Profile) -> Result<Sid, u32> {
+    let (name, display) = match profile {
+        Profile::Sealed => (wide(PROFILE), wide("Postman: разбор писем")),
+        Profile::Network { .. } => (wide(NETWORK_PROFILE), wide("Postman: почтовые протоколы")),
+    };
     let mut sid: PSID = null_mut();
     // SAFETY: строки нуль-терминированы; sid — выходной параметр.
     let hr = unsafe { CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), display.as_ptr(), null(), 0, &mut sid) };
@@ -232,13 +241,52 @@ fn app_container_sid() -> Result<Sid, u32> {
 }
 
 /// Удалить профиль AppContainer воркера (PAR-05: при удалении Postman); профиля нет — успех.
-pub(crate) fn remove_profile() -> Result<(), String> {
+pub fn remove_profile() -> Result<(), String> {
     // HRESULT_FROM_WIN32: ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_NOT_FOUND — профиля нет.
     const ABSENT: [u32; 3] = [0x8007_0002, 0x8007_0003, 0x8007_0490];
-    let name = wide(PROFILE);
-    // SAFETY: строка нуль-терминирована и живёт до конца вызова.
-    let hr = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
-    if hr >= 0 || ABSENT.contains(&(hr as u32)) { Ok(()) } else { Err(format!("DeleteAppContainerProfile: 0x{:08X}", hr as u32)) }
+    // Оба профиля — воркера и «сеть без файлов»; первая ошибка возвращается, второй профиль снимается всё равно.
+    let mut result = Ok(());
+    for profile in [PROFILE, NETWORK_PROFILE] {
+        let name = wide(profile);
+        // SAFETY: строка нуль-терминирована и живёт до конца вызова.
+        let hr = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
+        if hr < 0 && !ABSENT.contains(&(hr as u32)) && result.is_ok() {
+            result = Err(format!("DeleteAppContainerProfile({profile}): 0x{:08X}", hr as u32));
+        }
+    }
+    result
+}
+
+/// Права AppContainer профиля «сеть без файлов»: исходящие соединения в интернет (`internetClient`), сеть организации
+/// (`privateNetworkClientServer` — почтовый сервер в локальной сети; входящие закрывает отсутствие `listen` у кода и
+/// брандмауэр) и, по описанию плагина, вход учётной записью организации (`enterpriseAuthentication`).
+struct Capabilities {
+    /// Память под SID: на неё указывают элементы `list`.
+    _sids: Vec<Vec<u8>>,
+    list: Vec<SID_AND_ATTRIBUTES>,
+}
+
+fn capabilities(profile: Profile) -> io::Result<Capabilities> {
+    const SE_GROUP_ENABLED: u32 = 0x4;
+    let kinds: &[WELL_KNOWN_SID_TYPE] = match profile {
+        Profile::Sealed => &[],
+        Profile::Network { enterprise_auth: false } => &[WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid],
+        Profile::Network { enterprise_auth: true } => {
+            &[WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid, WinCapabilityEnterpriseAuthenticationSid]
+        }
+    };
+    let mut sids = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut len = sid.len() as u32;
+        // SAFETY: буфер размера SECURITY_MAX_SID_SIZE, длина — локальная переменная.
+        if unsafe { CreateWellKnownSid(*kind, null_mut(), sid.as_mut_ptr().cast(), &mut len) } == 0 {
+            return Err(last_error());
+        }
+        sids.push(sid);
+    }
+    let list = sids.iter_mut().map(|s| SID_AND_ATTRIBUTES { Sid: s.as_mut_ptr().cast(), Attributes: SE_GROUP_ENABLED }).collect();
+    Ok(Capabilities { _sids: sids, list })
 }
 
 /// Пара анонимных каналов; конец для дочернего процесса наследуемый.
@@ -334,7 +382,8 @@ impl Drop for Attributes {
     }
 }
 
-fn create(exe: &Path, sid: Option<PSID>, memory: usize) -> io::Result<Process> {
+fn create(launch: &Launch, sid: Option<PSID>) -> io::Result<Process> {
+    let (exe, memory): (&Path, usize) = (launch.exe, launch.memory);
     let (child_in, parent_in) = pipe(true)?;
     let (child_out, parent_out) = pipe(false)?;
     // Журнал воркера — канал к клиенту (SBX-01): дочернему — только конец на запись.
@@ -344,7 +393,13 @@ fn create(exe: &Path, sid: Option<PSID>, memory: usize) -> io::Result<Process> {
     let mitigations: u64 = mitigations();
     let child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
     let handles: [HANDLE; 3] = [child_in.0, child_out.0, child_err.0];
-    let caps = sid.map(|sid| SECURITY_CAPABILITIES { AppContainerSid: sid, Capabilities: null_mut(), CapabilityCount: 0, Reserved: 0 });
+    let mut granted = capabilities(launch.profile)?;
+    let caps = sid.map(|sid| SECURITY_CAPABILITIES {
+        AppContainerSid: sid,
+        Capabilities: if granted.list.is_empty() { null_mut() } else { granted.list.as_mut_ptr() },
+        CapabilityCount: granted.list.len() as u32,
+        Reserved: 0,
+    });
     let mut attrs = Attributes::new(if caps.is_some() { 4 } else { 3 })?;
     // SAFETY: все значения — локальные переменные, живущие до CreateProcessW.
     unsafe {
@@ -368,7 +423,9 @@ fn create(exe: &Path, sid: Option<PSID>, memory: usize) -> io::Result<Process> {
     si.lpAttributeList = attrs.ptr();
 
     let app: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut cmdline: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain(Some(0)).collect();
+    // Аргументы проверены ([`Launch::check_args`]): без пробелов и кавычек, экранирование не нужно.
+    let args: String = launch.args.iter().map(|a| format!(" {a}")).collect();
+    let mut cmdline: Vec<u16> = format!("\"{}\"{args}", exe.display()).encode_utf16().chain(Some(0)).collect();
     let env = environment();
     let cwd = wide("C:\\");
     // SAFETY: обнулённая выходная структура.
@@ -423,7 +480,18 @@ fn create(exe: &Path, sid: Option<PSID>, memory: usize) -> io::Result<Process> {
     let stderr = into_file(parent_err);
     let mut job = Some(job);
     let watched = process.clone();
+    let paced = process.clone();
     Ok(Process {
+        // Класс приоритета процесса: ниже обычного на время прогрева и обратно. Приоритет ввода-вывода чужому процессу
+        // документированным API не задать (`PROCESS_MODE_BACKGROUND_BEGIN` — только себе): он следует классу `IDLE`.
+        background: Box::new(move |on| {
+            // SAFETY: хэндл процесса жив, пока жив `paced`.
+            if unsafe { SetPriorityClass(paced.0, if on { IDLE_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS }) } != 0 {
+                Ok(())
+            } else {
+                Err(last_error())
+            }
+        }),
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
         stderr: Box::new(stderr),
@@ -457,7 +525,7 @@ const WER_FLAGS: u32 = 0x0001 | 0x0020;
 
 /// Внутри воркера: включить запрет win32k (если родитель не смог задать его при создании), проверить, что меры
 /// защиты действуют, и запретить кучу в отчётах WER (аналог `RLIMIT_CORE = 0`). Любая ошибка — отказ (SBX-02).
-pub(crate) fn lockdown() -> Result<(), String> {
+pub fn lockdown(_: Profile) -> Result<(), String> {
     // SAFETY: простой вызов без указателей.
     unsafe { SetErrorMode(ERROR_MODE) };
     // SAFETY: простой вызов без указателей.
@@ -496,6 +564,6 @@ fn policy_flags<T>(policy: i32) -> Result<u32, String> {
 }
 
 /// Смерть клиента на Windows ловит Job Object (`KILL_ON_JOB_CLOSE`): сторожу проверять нечего.
-pub(crate) fn parent() -> u32 {
+pub fn parent() -> u32 {
     0
 }

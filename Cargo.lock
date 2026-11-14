@@ -7799,6 +7799,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "postman-proc"
+version = "0.1.0-beta.7"
+dependencies = [
+ "landlock",
+ "libc",
+ "postcard",
+ "postman-proc",
+ "seccompiler",
+ "serde",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "postman-search"
 version = "0.1.0-beta.7"
 dependencies = [
@@ -7849,22 +7862,20 @@ dependencies = [
  "flate2",
  "hayro",
  "image",
- "landlock",
  "libc",
  "mail-parser",
  "postcard",
  "postman-export",
  "postman-ir",
+ "postman-proc",
  "postman-smime",
  "postman-worker",
  "pulldown-cmark",
  "quick-xml",
- "seccompiler",
  "serde",
  "serde_json",
  "tempfile",
  "wasmi",
- "windows-sys 0.61.2",
  "zeroize",
  "zip",
 ]

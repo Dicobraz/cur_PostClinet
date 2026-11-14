@@ -192,6 +192,16 @@ python docs/stand/net.py serve                                   # только 
 
 ## Диагностика песочницы
 
+Профиль «сеть без файлов» (ADR 0013, `postman-proc`): `cargo nextest run -p postman-proc` — процесс
+`postman-proc-probe` в песочнице пробует сеть, файлы, процессы, входящие. Замер старта (создание процесса в песочнице →
+ответ на первый вызов): `cargo test -p postman-proc --test network start_time -- --ignored --nocapture`.
+
+| ОС | Первый запуск | Повторный (медиана, n = 21) |
+|---|---|---|
+| Linux (Ubuntu 24.04, ядро 6.18, 4 ядра; отладочная и release-сборка) | 2,6 мс | 2,2–2,5 мс (1,9–3,8) |
+| Windows | не снят: нужен стенд | — |
+| macOS | не снят: нужен MacBook | — |
+
 Какое ограничение не даёт воркеру стартовать (только отладочная сборка):
 `cargo test -p postman-worker --test windows_probe -- --ignored --nocapture`. В CI — при ручном запуске
 (`workflow_dispatch`).

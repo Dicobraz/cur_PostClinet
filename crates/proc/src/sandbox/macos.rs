@@ -15,21 +15,53 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::Level;
+use super::{Launch, Level, Profile};
 use crate::Process;
 
 /// Предел кучи воркера; хосту модулей клиент передаёт свой (`wasm::JOB_MEMORY`).
-pub(crate) const MEMORY_LIMIT: usize = 1 << 30;
+pub const MEMORY_LIMIT: usize = 1 << 30;
 
 /// Профиль Seatbelt (SBPL): запрещено всё, исключений нет.
 const PROFILE: &str = "(version 1)\n(deny default)\n";
+
+/// Профиль «сеть без файлов» (ADR 0013): к «запрещено всё» — исходящие соединения IP, разрешение имён (сокет
+/// mDNSResponder и его настройки) и проверка сертификатов системой (службы trustd, хранилища корневых сертификатов —
+/// только чтение). Входящих соединений (`network-inbound`, `network-bind`), запуска процессов и файлов пользователя нет.
+const NETWORK_PROFILE: &str = r#"(version 1)
+(deny default)
+(allow network-outbound (remote ip "*:*"))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+(allow system-socket)
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.ocspd"))
+(allow file-read*
+  (literal "/private/etc/resolv.conf")
+  (literal "/private/var/run/resolv.conf")
+  (literal "/private/etc/hosts")
+  (subpath "/System/Library/Keychains")
+  (subpath "/Library/Keychains")
+  (subpath "/private/var/db/mds")
+  (subpath "/System/Library/Security")
+  (literal "/Library/Preferences/com.apple.security.plist")
+  (literal "/Library/Preferences/SystemConfiguration/preferences.plist"))
+(allow file-read-metadata)
+(allow sysctl-read)
+"#;
+
+/// Сколько дескрипторов у процесса «сеть без файлов»: соединения всех учёток вида.
+const NETWORK_NOFILE: u64 = 1024;
 
 /// Диагностика (только отладочные сборки, по образцу `POSTMAN_SANDBOX_DROP` на Windows):
 /// `POSTMAN_SANDBOX_ALLOW=mach-lookup,sysctl-read,…` добавляет к профилю `(allow …)` по каждой операции SBPL, `all` —
@@ -41,6 +73,7 @@ const ALLOW: &str = "POSTMAN_SANDBOX_ALLOW";
 unsafe extern "C" {
     fn getdtablesize() -> c_int;
     fn getppid() -> c_int;
+    fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
@@ -63,9 +96,16 @@ const RLIMIT_NOFILE: c_int = 8;
 
 /// Ослабленного режима нет. `memory` — предел кучи процесса ([`Limited`]): уходит
 /// аргументом `--memory=…`, окружение очищено.
-pub(crate) fn spawn(exe: &Path, memory: usize) -> io::Result<Process> {
-    let mut cmd = Command::new(exe);
-    cmd.env_clear().current_dir("/").arg(format!("--memory={memory}")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+pub fn spawn(launch: &Launch) -> io::Result<Process> {
+    launch.check_args()?;
+    let mut cmd = Command::new(launch.exe);
+    cmd.env_clear()
+        .current_dir("/")
+        .args(launch.args)
+        .arg(format!("--memory={}", launch.memory))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if cfg!(debug_assertions)
         && let Some(allow) = std::env::var_os(ALLOW)
     {
@@ -89,9 +129,21 @@ pub(crate) fn spawn(exe: &Path, memory: usize) -> io::Result<Process> {
         let _ = child.wait();
         return Err(io::Error::other("worker pipes are missing"));
     };
+    let pid = child.id();
     let child = Arc::new(Mutex::new(child));
     let watched = Arc::clone(&child);
     Ok(Process {
+        // Фоновый режим процесса (`PRIO_DARWIN_PROCESS`, `PRIO_DARWIN_BG`): планировщик и ввод-вывод разом.
+        background: Box::new(move |on| {
+            const PRIO_DARWIN_PROCESS: c_int = 4;
+            const PRIO_DARWIN_BG: c_int = 0x1000;
+            // SAFETY: простой системный вызов с номером своего дочернего процесса.
+            if unsafe { setpriority(PRIO_DARWIN_PROCESS, pid, if on { PRIO_DARWIN_BG } else { 0 }) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }),
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
         stderr: Box::new(stderr),
@@ -119,13 +171,13 @@ pub(crate) fn spawn(exe: &Path, memory: usize) -> io::Result<Process> {
     })
 }
 
-pub(crate) fn lockdown() -> Result<(), String> {
+pub fn lockdown(kind: Profile) -> Result<(), String> {
     // `args_os`: `args` упал бы на аргументе не в UTF-8.
     let memory = std::env::args_os().find_map(|a| a.to_str()?.strip_prefix("--memory=")?.parse::<usize>().ok()).unwrap_or(MEMORY_LIMIT);
     LIMIT.store(memory, Relaxed);
-    set_rlimits()?;
+    set_rlimits(kind)?;
     let allow = if cfg!(debug_assertions) { std::env::var(ALLOW).unwrap_or_default() } else { String::new() };
-    let Some(profile) = profile(&allow)? else { return Ok(()) };
+    let Some(profile) = profile(kind, &allow)? else { return Ok(()) };
     let mut err: *mut c_char = null_mut();
     // SAFETY: профиль — строка C, живая до конца вызова; `err` — указатель на локальную переменную, строку ошибки
     // освобождает `sandbox_free_error`.
@@ -148,8 +200,11 @@ pub(crate) fn lockdown() -> Result<(), String> {
 }
 
 /// Профиль с исключениями диагностики (`allow` — из [`ALLOW`]); `None` — без Seatbelt (`off`).
-fn profile(allow: &str) -> Result<Option<CString>, String> {
-    let mut text = String::from(PROFILE);
+fn profile(kind: Profile, allow: &str) -> Result<Option<CString>, String> {
+    let mut text = String::from(match kind {
+        Profile::Sealed => PROFILE,
+        Profile::Network { .. } => NETWORK_PROFILE,
+    });
     for op in allow.split(',').map(str::trim).filter(|op| !op.is_empty()) {
         match op {
             "off" => return Ok(None),
@@ -162,7 +217,7 @@ fn profile(allow: &str) -> Result<Option<CString>, String> {
     CString::new(text).map(Some).map_err(|e| e.to_string())
 }
 
-fn set_rlimits() -> Result<(), String> {
+fn set_rlimits(kind: Profile) -> Result<(), String> {
     let set = |res, v: u64| {
         let lim = RLimit { cur: v, max: v };
         // SAFETY: передаём указатель на локальную структуру.
@@ -174,7 +229,7 @@ fn set_rlimits() -> Result<(), String> {
     set(RLIMIT_CORE, 0)?;
     // stderr — канал к клиенту (SBX-01), не файл журнала: запись в обычные файлы не нужна вовсе.
     set(RLIMIT_FSIZE, 0)?;
-    set(RLIMIT_NOFILE, 16)
+    set(RLIMIT_NOFILE, if kind == Profile::Sealed { 16 } else { NETWORK_NOFILE })
 }
 
 /// Байт кучи Rust занято сейчас.
@@ -257,7 +312,7 @@ unsafe impl GlobalAlloc for Limited {
 
 /// Проверки песочницы для тестов (только отладочная сборка): служба Mach и sysctl должны быть недоступны.
 #[cfg(debug_assertions)]
-pub(crate) mod probe {
+pub mod probe {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::ptr::null_mut;
 
@@ -268,7 +323,7 @@ pub(crate) mod probe {
     }
 
     /// Найти службу Mach `name` у launchd: `Ok` — порт получен.
-    pub(crate) fn mach_lookup(name: &str) -> Result<(), String> {
+    pub fn mach_lookup(name: &str) -> Result<(), String> {
         let name = CString::new(name).map_err(|e| e.to_string())?;
         let mut port = 0u32;
         // SAFETY: `bootstrap_port` — порт процесса от libSystem, только читается; имя — строка C, `port` — локальная.
@@ -277,7 +332,7 @@ pub(crate) mod probe {
     }
 
     /// Прочитать sysctl `name`: `Ok` — значение получено.
-    pub(crate) fn sysctl(name: &str) -> Result<(), String> {
+    pub fn sysctl(name: &str) -> Result<(), String> {
         let name = CString::new(name).map_err(|e| e.to_string())?;
         // Только размер значения: проверка Seatbelt — та же, а мал ли буфер, не важно.
         let mut len = 0usize;
@@ -288,14 +343,14 @@ pub(crate) mod probe {
 }
 
 /// Родитель процесса — клиент; сменился — клиент умер (сторож, SBX-03).
-pub(crate) fn parent() -> u32 {
+pub fn parent() -> u32 {
     // SAFETY: простой системный вызов без аргументов.
     unsafe { getppid() as u32 }
 }
 
 /// Открыт ли дескриптор (`fcntl(F_GETFD)`; проверка `Probe::Fd`, отладочная сборка).
 #[cfg(debug_assertions)]
-pub(crate) fn probe_fd(fd: i32) -> Result<(), String> {
+pub fn probe_fd(fd: i32) -> Result<(), String> {
     const F_GETFD: c_int = 1;
     // SAFETY: fcntl с F_GETFD только читает флаги; номер может быть закрыт — тогда ошибка EBADF.
     if unsafe { fcntl(fd, F_GETFD) } < 0 { Err(io::Error::last_os_error().to_string()) } else { Ok(()) }

@@ -1,7 +1,7 @@
 # PLG-01: общий механизм процессов и песочница «сеть без файлов»
 
 lane: x/plg-proc            # новый крейт crates/proc, crates/worker, deps, lanes.toml
-status: todo
+status: review
 deps: []
 class: B                    # песочница (CODEOWNERS), новый крейт, lanes.toml
 files: [crates/proc/*, crates/worker/src/lib.rs, crates/worker/src/sandbox/*, crates/worker/tests/*, crates/worker/Cargo.toml, crates/core/tests/layers.rs, Cargo.toml, Cargo.lock, lanes.toml, docs/adr/0013-plugins-on-demand.md, docs/00-ARCHITECTURE.md, docs/DEV.md]
@@ -30,3 +30,20 @@ manual: no
 Тесты песочницы воркера и просмотрщика зелёные без правок ожиданий; новый профиль проверен тестами на трёх ОС (сеть
 наружу есть; файлов, дочерних процессов и входящих соединений нет); замер старта записан; слой `postman-proc` — в
 `layers.rs`.
+
+## Сделано
+- Крейт `postman-proc` (L1, полоса `sandbox`, `layers.rs`, `lanes.toml`): из `crates/worker` переехали `sandbox::spawn` /
+  `isolate` / `lockdown`, кадры, журнал stderr, сторож, коды выхода. `postman-worker` и `postman-viewer` пользуются им;
+  их тесты зелёные без правок ожиданий (Linux: 168/168).
+- Длинная связь `postman_proc::link`: сообщения, вызов с ответом по номеру, `Ping`/`Pong`, `Shutdown`; postcard.
+- Профиль `Profile::Network` на трёх ОС; удаление программы снимает оба профиля AppContainer (тот же
+  `postman-worker --remove-appcontainer`).
+- Приоритет на время прогрева: `Process::background` (Windows — класс приоритета, macOS — фоновый режим процесса,
+  Linux — `SCHED_BATCH` и класс ввода-вывода idle у всех потоков).
+- Тесты `crates/proc/tests/network.rs`; замер старта Linux — `docs/DEV.md`; таблица проверки — ADR 0013.
+
+## Не сделано
+- Замер старта на Windows и macOS (нужен стенд).
+- Проверка на стенде: системный прокси, корпоративный корневой сертификат, вход учётной записью Windows (SSPI),
+  Kerberos — строки «не проверено» в ADR 0013. Kerberos на macOS и Linux в профиле не работает (причина — там же).
+- HTTPS в профиле на Windows и macOS — с первым плагином через процесс (PLG-02).

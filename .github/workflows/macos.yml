@@ -87,6 +87,9 @@ jobs:
 
       - name: Release-сборка
         run: cargo build --release --workspace --locked --features postman-worker/viewer
+        env:
+          POSTMAN_TG_API_ID: ${{ secrets.TKNAPPID }}
+          POSTMAN_TG_API_HASH: ${{ secrets.TKNZORIO }}
 
       - name: Postman.app и zip
         id: package

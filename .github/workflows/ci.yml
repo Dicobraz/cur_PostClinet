@@ -363,6 +363,9 @@ jobs:
       - name: Release-сборка для кэша
         if: steps.look.outputs.cache-hit != 'true'
         run: cargo build --release --workspace --locked --features postman-worker/viewer
+        env:
+          POSTMAN_TG_API_ID: ${{ secrets.TKNAPPID }}
+          POSTMAN_TG_API_HASH: ${{ secrets.TKNZORIO }}
 
   # main, теги `v*`, ручной запуск и PR, что правят выпуск: release, подпись, комплекты. Идёт параллельно с тестами —
   # красные тесты не лишают комплектов, но не дают выпуска (`publish` ждёт `test`). Платформа — строка matrix и свой
@@ -414,6 +417,9 @@ jobs:
       # postman.exe интерпретатора WASM нет (на него ссылается только main хоста модулей).
       - name: Release-сборка
         run: cargo build --release --workspace --locked --features postman-worker/viewer
+        env:
+          POSTMAN_TG_API_ID: ${{ secrets.TKNAPPID }}
+          POSTMAN_TG_API_HASH: ${{ secrets.TKNZORIO }}
 
       # Подпись (S4-01, решение владельца 1): только если заданы секреты с сертификатом, иначе — уведомление
       # (scripts/windows/sign.ps1). Exe — до архива, MSI — после: хэш winget считается от подписанного MSI.

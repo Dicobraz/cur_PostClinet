@@ -278,6 +278,60 @@ calcard 0,43, html5ever 0,2 + таблица сущностей HTML 0,33, де�
 | 10 | Бюджет после CH-02 и CH-03 (Telegram, #691): `postman.exe` 72,05 МиБ (75 553 792 байт) — ≤ 70 превышен на 2,05 | Поднять до ≤ 74 МиБ малым шагом (правило владельца 2026-10-22: без скачка на 10 % — повышать и писать на финал); вклад Telegram отдельно не мерили | Поднято 2026-11-14: `postman.exe` ≤ 74 МиБ; SIZE-01 перед 1.0 (~−3,5…−5 МиБ), затем бюджет ~68 |
 | 11 | Канал Matrix (CH-05, `matrix-sdk` с шифрованием): один release-замер 2026-11-14, MSVC, профиль release — `postman.exe` без канала **72,21 МиБ** (75 721 728 байт, в бюджете ≤ 74), с каналом (`--features matrix-release`) **103,34 МиБ** (108 361 216 байт): **+31,13 МиБ**, больше порога 5 МиБ | Канал в обычной release-сборке выключен (признак `matrix-release`, код в exe не попадает; в dev — есть). Перед включением в выпуск — `opt-level = "s"` крейтам `matrix-sdk*`, `ruma*`, `vodozemac` (холодный код канала) с замером; бюджет `postman.exe` ≤ 74 МиБ не меняется | — (ждёт решения владельца) |
 | 12 | Matrix по размеру (2026-11-14, тот же стенд и профиль, `--features matrix-release`): крейтам, которые тянет только Matrix (68 имён по `cargo tree`: `matrix-sdk*`, `ruma*`, `vodozemac`, `postman-backend-matrix`, `imbl`, `eyeball*`, `*-dalek`, `prost`, `rmp*`, `oauth2`…; общие с остальным exe `sha2`, `rand`, `digest` не тронуты), задан свой `opt-level` в профиле release — библиотеки не патчены. `postman.exe` с каналом: было **103,34 МиБ** → `"s"` 89,11 МиБ (93 437 952 байт) → `"z"` **87,97 МиБ** (92 239 872 байт), оставлен `"z"`: **−15,37 МиБ**. Над сборкой без канала (72,21, не перемеряли — без `matrix-release` профиль на exe не влияет) остаётся **+15,76 МиБ**, над бюджетом ≤ 74 — +13,97. `cargo bloat --crates` (`.text` 66,4 МиБ): `matrix_sdk` 2,1, `matrix_sdk_crypto` 1,8, `postman_backend_matrix` 1,4, `matrix_sdk_base` 1,3, `ruma_events` 0,98, `matrix_sdk_common` 0,95, `ruma_client_api` 0,47, `ruma_common` 0,20 — ~9,2 МиБ в самих крейтах, остальное — обобщения, встроенные в `postman` (9,3), `std` (8,4), `serde_core` (0,93), и данные | Профилем больше не ужать: остаток — сам объём `matrix-sdk`. Варианты включения: (а) поднять бюджет `postman.exe` до ~≤ 90 МиБ — просто, но +22 % к exe у всех, даже без Matrix; (б) канал отдельным процессом-плагином (`postman-matrix.exe`, как воркер) — `postman.exe` остаётся ≤ 74, но это новая задача (договор обмена, запуск, упаковка) и ~16+ МиБ отдельным файлом; (в) свой тонкий клиент на `ruma` + `vodozemac` без `matrix-sdk` — меньше всего, но самая большая работа и своя логика шифрования. Рекомендация — (б); до решения канал в release выключен | — (ждёт решения владельца) |
+| 13 | Состав Matrix и функциональные дубли (SIZE-13, 2026-11-14, `cargo tree` под `x86_64-pc-windows-msvc` с каналом и без, main 488e3ac; разбор — «Состав канала Matrix и дубли» ниже): канал прибавляет **84 пакета** (760 против 676), из них 5 — proc-macro. Хранилища, кроме redb, нет (sqlite, rusqlite, indexeddb не собираются — только строки в `Cargo.lock`); HTTP-клиент, TLS и провайдер крипто — те же (reqwest 0.13.5, rustls + aws-lc-rs); serde_json, aes, hmac, hkdf, sha2 0.11, zeroize, base64, regex, flate2, время, uuid — те же версии. Остались **11 вторых версий** (sha2 0.10, digest 0.10, block-buffer 0.10, crypto-common 0.1, cpufeatures 0.2, rand 0.8, rand_chacha 0.3, rand_core 0.6 — все от `oauth2` 5.0.0; rand 0.10, itertools 0.15, constant_time_eq 0.4) и функциональные пары внутри SDK (ulid ↔ uuid, unicode-normalization ↔ icu_normalizer, mime2ext ↔ mime_guess, serde_html_form ↔ serde_urlencoded, rmp/prost ↔ postcard, dalek/chacha20poly1305 ↔ aws-lc-rs). **Убрано: ничего** — признаки `matrix-sdk*` уже минимальны (CH-05: `default-features = false`, у `-base`/`-crypto`/`-common`/`-store-encryption` по умолчанию пусто), все крейты-владельцы дублей — последних версий на crates.io, держат дубли обязательными (не за признаком) зависимостями; согласовать можно только `[patch]`/форком. Release-замера нет (зависимости не менялись); вклад дублей в МиБ не мерили | Дубли не убрать без патча библиотек; размер Matrix решает вынос в отдельный процесс — PLG-04 (ADR 0013): тогда эти 84 пакета в `postman.exe` не попадают вовсе. Вне Postman (без патча у нас): предложить `oauth2` переход на sha2 0.11 и rand 0.9+/0.10, `matrix-sdk` — `oauth2` за признаком (вход MAS нам пока не нужен) | — (к сведению) |
+
+## Состав канала Matrix и дубли (SIZE-13, 2026-11-14)
+
+Вопрос владельца: «Matrix содержит уйму всего, что можно вынести, например sqlite и прочее… выкинь функциональные
+дубли, делай на единых продуктах». Метод (main 488e3ac, граф для Windows, только обычные зависимости):
+
+```
+cargo tree -p postman-gpui --target x86_64-pc-windows-msvc -e normal --prefix none --no-dedupe -f '{p}' --features matrix-release
+cargo tree -p postman-gpui --target x86_64-pc-windows-msvc -e normal --prefix none --no-dedupe -f '{p}' --no-default-features --features telegram
+# то же с -e normal,features — признаки общих крейтов, которые включает только Matrix; с -d --depth 0 — дубли версий
+```
+
+С каналом — 760 пакетов, без — 676: **только Matrix — 84** (5 из них proc-macro, в exe не попадают). Признаки самих
+`matrix-sdk*` уже минимальны (CH-05): `matrix-sdk` — `default-features = false` и `e2e-encryption`,
+`automatic-room-key-forwarding` (запрос ключей комнат у своих устройств — функция канала), `rustls-aws-lc-rs`
+(= `reqwest/rustls`, тот же TLS, что у JMAP; в отдельном процессе PLG-04 даст ему TLS); у `matrix-sdk-base`, `-crypto`,
+`-common`, `-store-encryption` признаков по умолчанию нет. Признаки общих крейтов, которые включает только Matrix и
+которые зашиты в его объявления зависимостей: reqwest `gzip`, `stream`, `rustls-no-provider` (→ tower-http
+`decompression-gzip`), tokio `fs`, url и bitflags `serde`, `zeroize` у aes/cbc/cipher — мелочь, без новых библиотек.
+
+| Функция | Уже в Postman (без канала) | Принёс Matrix | Действие / причина |
+|---|---|---|---|
+| Хранилище | redb 4.5 (база профиля), postcard | — | ничего: `matrix-sdk` без `sqlite`, хранилища SDK — свои поверх `PluginStore` (CH-05). `matrix-sdk-sqlite`, `rusqlite`, `libsqlite3-sys`, `matrix-sdk-indexeddb` есть только строками в `Cargo.lock` (cargo пишет туда и невключённые необязательные зависимости): `cargo tree --workspace --all-features --target all -i rusqlite` — «nothing to print», не собираются |
+| HTTP | reqwest 0.13.5, hyper 1.12, h2 0.4 (и ureq у самообновления, hyper напрямую у EWS) | `oauth2-reqwest` — переходник к тому же reqwest | ничего: второго клиента нет |
+| TLS, провайдер крипто | rustls 0.23.46 + aws-lc-rs 1.18; SChannel (`native-tls`: EWS, ureq); ring 0.17 | — | ничего: `rustls-no-provider` + `reqwest/rustls` — тот же aws-lc-rs |
+| Хэши, MAC, KDF | sha2 0.11, sha1 0.11, md-5, hmac 0.13, hkdf 0.13, pbkdf2 0.13 | sha2 **0.10** + digest 0.10, block-buffer 0.10, crypto-common 0.1, generic-array 0.14, cpufeatures 0.2 — только у `oauth2` 5.0.0; blake3 1.8 (ключи `StoreCipher`), xxhash-rust (фильтр Блума SDK) | оставить: `oauth2` 5.0.0 — последняя версия, в `matrix-sdk` 0.19.1 обязательна; blake3 и xxhash — внутри SDK. hmac, hkdf, sha2 0.11 у vodozemac и SDK — общие с Postman |
+| Кривые, AEAD | aws-lc-rs (X25519, Ed25519, ChaCha20-Poly1305 — внутри rustls), p256/p384 (S/MIME), aes 0.9, aes-gcm 0.11 | curve25519-dalek 5, x25519-dalek 3, ed25519-dalek 3, chacha20poly1305 0.11, poly1305, hpke 0.14 | оставить: Olm/Megolm (`vodozemac`) и `StoreCipher` написаны на dalek/RustCrypto, провайдер не подставляется; aes, aes-gcm — общие |
+| Случайные числа | rand 0.9 (gpui, tantivy), rand_core 0.9 и 0.10, getrandom 0.2/0.3/0.4 | rand **0.10** (matrix-sdk-crypto, vodozemac, ruma, ulid; rand_core 0.10 уже в сборке); rand **0.8** + rand_chacha 0.3 + rand_core 0.6 (`oauth2`) | оставить: 0.9 держат gpui и tantivy, 0.10 — SDK, 0.8 — oauth2; общей версии нет. getrandom новых версий не прибавил |
+| zeroize, base64, subtle | zeroize 1.9, base64 0.22 и 0.23, base64ct, subtle 2.6 | те же версии | ничего |
+| Сериализация | serde_json 1.0.154, postcard 1.1, serde_urlencoded | rmp/rmp-serde (формат хранилищ SDK и `StoreCipher`), prost 0.14 (сообщения Olm — protobuf по протоколу), serde_html_form (query-строки ruma), serde_bytes, serdect, serde_path_to_error | оставить: форматы зашиты в SDK и протокол, postcard на их место не подставить; serde_json — тот же; bincode и CBOR нет |
+| HTML, Markdown, санитайзер | html5ever 0.39, pulldown-cmark 0.13 | — | ничего: `ruma/markdown` и `ruma-html` не включены |
+| Картинки, MIME | image 0.25, mime 0.3, mime_guess 2 | mime2ext (тип → расширение при загрузке файла) | оставить: обязательная зависимость `matrix-sdk` |
+| OAuth, OIDC | нет (EWS — NTLM/Kerberos, JMAP — пароль) | oauth2 5.0.0, oauth2-reqwest (вход MAS, MSC3861 — у нас не вызывается) | оставить: не за признаком; невызываемый код выкидывает компоновщик, но версии sha2 0.10 и rand 0.8 тянутся |
+| Время | jiff 0.2, chrono 0.4 + chrono-tz, time 0.3, web-time | date_header (дата HTTP в ruma) | ничего: новых библиотек времени нет |
+| Идентификаторы | uuid 1.29 | ulid 3 (`matrix-sdk-crypto`) | оставить: в SDK |
+| Нормализация Unicode | icu_normalizer 2.4 (idna) | unicode-normalization 0.1, decancer (имена в комнатах, `matrix-sdk-base`) | оставить: в SDK |
+| regex, шаблоны | regex 1.13, globset, glob | wildmatch (условия правил push в ruma) | regex — тот же; wildmatch — в ruma |
+| Сжатие | flate2 1.1, zstd 0.14 | async-compression, compression-codecs/-core — gzip ответов поверх того же flate2 | оставить: `reqwest/gzip` зашит в `matrix-sdk` |
+| Async-утилиты | tokio 1.54, tokio-stream, tokio-util, futures 0.3, async-trait, arc-swap, parking_lot | eyeball/eyeball-im, imbl (+ imbl-sized-chunks, archery, wide, safe_arch), readlock(-tokio), async-stream, backon (повторы SDK — у нас выключены, паузу держит ядро) | оставить: наблюдаемые значения и списки SDK, аналога в Postman нет; все обязательные |
+| Мелкое внутри SDK | base16ct | hex 0.4, bytesize, language-tags, maplit, anymap2, as_variant, assign, js_int, js_option, konst/typewit/const_panic, bs58, matrix-pickle, ruma-* | оставить |
+
+**Дубли версий** (`-d`): без канала 123 строки (gpui, resvg, windows…), с каналом — плюс 11 вторых версий: sha2 0.10,
+digest 0.10, block-buffer 0.10, crypto-common 0.1, cpufeatures 0.2, rand 0.8, rand_chacha 0.3, rand_core 0.6 (все —
+`oauth2`), rand 0.10 (SDK), itertools 0.15 (`matrix-sdk`, `-crypto`; в сборке уже 0.11, 0.13, 0.14 от чужих крейтов),
+constant_time_eq 0.4 (blake3; 0.6 — у zip). `js_int` и `ruma-identifiers-validation` в выводе `-d` — та же версия для
+proc-macro `ruma-macros`, не дубль. Владельцы — последних версий на crates.io (oauth2 5.0.0, blake3 1.8.7,
+matrix-sdk 0.19.1, vodozemac 0.11.2, ruma 0.17.2, imbl 7.0.2): `Cargo.lock` согласовать нечего.
+
+**Итог: убрано — ничего, дублей без патча нет.** sqlite в сборке не было и нет; HTTP, TLS, провайдер крипто, хранилище,
+JSON, общая криптография — единые. Оставшееся — внутренности `matrix-sdk`/`vodozemac`/`oauth2`: убираются только форком
+или `[patch]` (запрещено) либо снаружи — предложения в `oauth2` (sha2 0.11, rand 0.10) и в `matrix-sdk` (`oauth2` за
+признаком). Release-сборки не было: зависимости не менялись, размер тот же (№12). Вклад дублей в МиБ отдельно не мерили;
+весь канал — +15,76 МиБ (№12), и он уходит из `postman.exe` целиком с выносом в отдельный процесс (PLG-04, ADR 0013).
 
 ## Замер после S8 (S8-34, 2026-10-30)
 

@@ -52,9 +52,22 @@ jobs:
         id: package
         run: bash scripts/linux/package.sh --target-dir "$CARGO_TARGET_DIR" --out dist
 
-      - name: Артефакт сборки
+      # Артефакты сборки — по файлу, без zip вокруг (`archive: false`, имя артефакта = имя файла): .AppImage, .deb, .rpm.
+      - name: Артефакт сборки .AppImage
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.dir }}
+          path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}.AppImage
+          archive: false
+          if-no-files-found: error
+      - name: Артефакт сборки .deb
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}.deb
+          archive: false
+          if-no-files-found: error
+      - name: Артефакт сборки .rpm
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}.rpm
+          archive: false
           if-no-files-found: error

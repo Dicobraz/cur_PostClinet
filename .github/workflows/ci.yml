@@ -384,16 +384,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # pkg — расширения файлов пакета: каждый — отдельный артефакт сборки (шаги «Артефакт сборки»).
           - platform: windows-x64
             runner: windows-latest
             cache: windows-release
+            pkg: [msi, zip]
           - platform: macos-arm64
             runner: macos-26
             cache: macos-release
+            pkg: [dmg, zip]
           - platform: linux-x64
             runner: ubuntu-24.04
             cache: linux-release-alma9
             container: almalinux:9
+            pkg: [AppImage, deb, rpm]
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     timeout-minutes: ${{ matrix.container && 90 || 60 }}
@@ -502,7 +506,8 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: bash scripts/macos/package.sh --target-dir "$CARGO_TARGET_DIR" --out dist
 
-      # Linux: AppImage, deb и rpm (scripts/linux/package.sh) — одна папка, она же артефакт и файлы выпуска.
+      # Linux: AppImage, deb и rpm (scripts/linux/package.sh) — одна папка (выход assets): файлы выпуска; артефакты
+      # сборки — по файлу.
       - name: AppImage, deb и rpm
         if: runner.os == 'Linux'
         id: package_linux
@@ -525,15 +530,36 @@ jobs:
             echo "::error::Тег $GITHUB_REF_NAME не совпадает с версией v$VERSION из Cargo.toml"; exit 1
           fi
 
-      # Для разработки (Actions → запуск → Artifacts): postman-<версия>-windows-x64 — exe приложения, воркера и
-      # хоста модулей просмотра, README.txt, install.ps1; postman-<версия>-macos-arm64 — .zip и .dmg (Postman.app
-      # внутри: бандл в артефакт не кладётся — Actions теряет права на запуск и подпись); postman-<версия>-linux-x64 —
-      # .AppImage, .deb и .rpm.
-      - name: Артефакт сборки
+      # Для разработки (Actions → запуск → Artifacts): каждый файл пакета — отдельный артефакт без zip вокруг
+      # (`archive: false`, имя артефакта = имя файла), скачивается как есть: postman-<версия>-windows-x64.msi и .zip
+      # (exe приложения, воркера и хоста модулей просмотра, README.txt, install.ps1); postman-<версия>-macos-arm64.dmg
+      # и .zip (Postman.app внутри: бандл в артефакт не кладётся — Actions теряет права на запуск и подпись);
+      # postman-<версия>-linux-x64.AppImage, .deb и .rpm. Расширения — `matrix.pkg`, по шагу на файл.
+      - name: Файлы пакета
+        id: pkg
+        shell: bash
+        env:
+          DIR: ${{ steps.package.outputs.assets || steps.package_macos.outputs.assets || steps.package_linux.outputs.assets }}
+          NAME: ${{ steps.package.outputs.name || steps.package_macos.outputs.name || steps.package_linux.outputs.name }}
+        run: echo "base=$DIR/$NAME" >> "$GITHUB_OUTPUT"
+      - name: Артефакт сборки .${{ matrix.pkg[0] }}
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: ${{ steps.package.outputs.name || steps.package_macos.outputs.name || steps.package_linux.outputs.name }}
-          path: ${{ steps.package.outputs.dir || steps.package_macos.outputs.dir || steps.package_linux.outputs.dir }}
+          path: ${{ steps.pkg.outputs.base }}.${{ matrix.pkg[0] }}
+          archive: false
+          if-no-files-found: error
+      - name: Артефакт сборки .${{ matrix.pkg[1] }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.pkg.outputs.base }}.${{ matrix.pkg[1] }}
+          archive: false
+          if-no-files-found: error
+      - name: Артефакт сборки .${{ matrix.pkg[2] }}
+        if: matrix.pkg[2]
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.pkg.outputs.base }}.${{ matrix.pkg[2] }}
+          archive: false
           if-no-files-found: error
 
       - name: Артефакт winget
@@ -577,9 +603,10 @@ jobs:
     container: ${{ matrix.image }}
     timeout-minutes: 15
     steps:
+      # Артефакт сборки — сам файл пакета (`archive: false`): download-artifact v8 кладёт его в pkg/ как есть.
       - uses: actions/download-artifact@v8.0.2
         with:
-          pattern: postman-*-linux-x64
+          pattern: postman-*-linux-x64.${{ matrix.kind }}
           path: pkg
           merge-multiple: true
       - name: Установка, запуск, удаление (${{ matrix.kind }})

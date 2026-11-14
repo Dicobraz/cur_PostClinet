@@ -91,7 +91,7 @@ jobs:
           POSTMAN_TG_API_ID: ${{ secrets.TKNAPPID }}
           POSTMAN_TG_API_HASH: ${{ secrets.TKNZORIO }}
 
-      - name: Postman.app и zip
+      - name: Postman.app, zip и dmg
         id: package
         run: bash scripts/macos/package.sh --target-dir "$CARGO_TARGET_DIR" --out dist
 
@@ -152,11 +152,18 @@ jobs:
           path: shots
           if-no-files-found: warn
 
-      - name: Артефакт сборки
+      # Артефакты сборки — по файлу, без zip вокруг (`archive: false`, имя артефакта = имя файла): .zip и .dmg.
+      - name: Артефакт сборки .zip
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.zip }}
+          archive: false
+          if-no-files-found: error
+      - name: Артефакт сборки .dmg
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.package.outputs.dmg }}
+          archive: false
           if-no-files-found: error
 
       - name: Итог снимков ×3

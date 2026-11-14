@@ -1,10 +1,18 @@
 //! Подключённая учётка Telegram (`ChannelSession`): догон (`getState`, диалоги, папки, последние сообщения), поток
 //! обновлений (ADR 0012 «Проверка договора», поток событий), история, поиск на сервере, действия, файлы. Пишет
 //! события в `incoming`; хранение — у ядра.
+//!
+//! - **Альбомы** (`grouped_id`): части — одним сообщением модели (номер — первой части, [`convert::merge_album`]);
+//!   части одной пачки, страницы истории и поиска сводятся вместе, недавние альбомы — в памяти сеанса ([`Kept`]):
+//!   поздняя часть, правка, удаление части дают альбом заново. Отправка нескольких файлов — альбомом
+//!   (`messages.sendMultiMedia`, по 10): фото и видео вместе, документы и музыка — своими группами.
+//! - **Папки**: состав — по правилам папки и состоянию бесед ([`convert::folders`]); заглушили, прочитали, убрали
+//!   в архив, поменяли папку (`updateDialogFilter*`) — папки пересчитываются и уходят событием `Folders`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::Hash;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +26,7 @@ use postman_core::channel::{
 use postman_ir::{Align, Block, Document, Inline};
 
 use crate::convert::{self, Ctx, Kindly, Source, UpFile};
+use crate::extra::{self, TgExtra};
 use crate::ids::{Peer, PeerBook, msg_id, parse_msg, user_of};
 use crate::text;
 use crate::vault::UpdState;
@@ -35,6 +44,75 @@ const PART: usize = 512 * 1024;
 const BIG_FILE: u64 = 10 * 1024 * 1024;
 /// Проверка связи (`updates.getState`): сеть тихо пропала — заметить и догнать.
 const HEARTBEAT: Duration = Duration::from_secs(60);
+/// Частей в альбоме — не больше (предел Telegram для `sendMultiMedia`).
+const ALBUM_MAX: usize = 10;
+/// Недавних альбомов и опросов — в памяти сеанса.
+const KEPT: usize = 256;
+
+/// Недавнее по ключу: не больше [`KEPT`], старое вытесняется.
+pub(crate) struct Kept<K, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K: Hash + Eq + Clone, V> Default for Kept<K, V> {
+    fn default() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new() }
+    }
+}
+
+impl<K: Hash + Eq + Clone, V> Kept<K, V> {
+    fn entry(&mut self, k: K, make: impl FnOnce() -> V) -> &mut V {
+        if !self.map.contains_key(&k) {
+            self.order.push_back(k.clone());
+            while self.order.len() > KEPT {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+        self.map.entry(k).or_insert_with(make)
+    }
+
+    fn get(&self, k: &K) -> Option<&V> {
+        self.map.get(k)
+    }
+
+    fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        self.map.get_mut(k)
+    }
+
+    fn remove(&mut self, k: &K) {
+        self.map.remove(k);
+        self.order.retain(|x| x != k);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.map.iter()
+    }
+}
+
+/// Части альбома, виденные в сеансе, и номер, под которым альбом ушёл ядру.
+#[derive(Default)]
+struct Group {
+    parts: BTreeMap<i32, Message>,
+    head: Option<i32>,
+}
+
+type AlbumKey = (ConversationId, i64);
+
+/// Сообщение с номером альбома (`grouped_id`) — до сведения частей.
+type Raw = (ConversationId, Message, Option<i64>);
+/// Прежние номера альбомов, ставших другими: ядру — удалить.
+type Stale = Vec<(ConversationId, i32)>;
+
+/// Тип беседы для правил папок — не меняется на лету (кроме отметки «непрочитано»).
+#[derive(Debug, Clone, Copy, Default)]
+struct Kind {
+    contact: bool,
+    bot: bool,
+    marked: bool,
+}
 
 pub(crate) struct Inner {
     wire: Rc<dyn Wire>,
@@ -51,6 +129,16 @@ pub(crate) struct Inner {
     feeding: Cell<bool>,
     authed_dcs: RefCell<HashSet<i32>>,
     tasks: RefCell<Vec<tokio::task::JoinHandle<()>>>,
+    /// Себя — для задач (дочитать альбом, опрос, папки).
+    weak: Weak<Inner>,
+    albums: RefCell<Kept<AlbumKey, Group>>,
+    /// Опросы по номеру: беседа и сообщение (итоги приходят без него).
+    polls: RefCell<Kept<i64, (ConversationId, Message)>>,
+    /// Папки Telegram как у сервера, тип бесед, порядок диалогов, последние отданные папки.
+    filters: RefCell<Vec<tl::enums::DialogFilter>>,
+    kinds: RefCell<HashMap<ConversationId, Kind>>,
+    order: RefCell<Vec<ConversationId>>,
+    last_folders: RefCell<Vec<ChannelFolder>>,
 }
 
 pub(crate) struct TgSession(Rc<Inner>);
@@ -84,6 +172,113 @@ fn messages_parts(m: tl::enums::messages::Messages) -> (Vec<tl::enums::Message>,
         tl::enums::messages::Messages::ChannelMessages(m) => (m.messages, m.users, m.chats, Some(m.count)),
         tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new(), None),
     }
+}
+
+/// Сообщения ответа с номерами альбомов.
+fn raw(ms: &[tl::enums::Message], cx: &Ctx) -> Vec<Raw> {
+    ms.iter().filter_map(|m| convert::message(m, cx).map(|(c, x)| (c, x, convert::grouped(m)))).collect()
+}
+
+/// Номер папки сервера; «Все чаты» — без номера.
+fn filter_id(f: &tl::enums::DialogFilter) -> Option<i32> {
+    match f {
+        tl::enums::DialogFilter::Filter(f) => Some(f.id),
+        tl::enums::DialogFilter::Chatlist(f) => Some(f.id),
+        tl::enums::DialogFilter::Default => None,
+    }
+}
+
+/// Группа альбома по выгруженному медиа (как у официальных клиентов): фото и видео — вместе, музыка — своей
+/// группой, прочие документы — своей; голос, кружок, анимация, стикер — только по одному.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Visual,
+    Music,
+    Files,
+    Alone,
+}
+
+fn class_of(m: &tl::enums::MessageMedia) -> Class {
+    use tl::enums::DocumentAttribute as A;
+    match m {
+        tl::enums::MessageMedia::Photo(_) => Class::Visual,
+        tl::enums::MessageMedia::Document(d) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else { return Class::Alone };
+            if d.voice || d.round {
+                return Class::Alone;
+            }
+            let attrs = &doc.attributes;
+            if attrs.iter().any(|a| matches!(a, A::Sticker(_) | A::Animated)) {
+                Class::Alone
+            } else if attrs.iter().any(|a| matches!(a, A::Video(v) if !v.round_message)) {
+                Class::Visual
+            } else if attrs.iter().any(|a| matches!(a, A::Audio(au) if au.voice)) {
+                Class::Alone
+            } else if attrs.iter().any(|a| matches!(a, A::Audio(_))) {
+                Class::Music
+            } else {
+                Class::Files
+            }
+        }
+        _ => Class::Alone,
+    }
+}
+
+/// Выгруженное медиа (`messages.uploadMedia`) → ссылка на него для альбома.
+fn media_ref(m: &tl::enums::MessageMedia) -> Option<tl::enums::InputMedia> {
+    match m {
+        tl::enums::MessageMedia::Photo(p) => {
+            let Some(tl::enums::Photo::Photo(ph)) = &p.photo else { return None };
+            Some(
+                tl::types::InputMediaPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    id: tl::types::InputPhoto { id: ph.id, access_hash: ph.access_hash, file_reference: ph.file_reference.clone() }.into(),
+                    ttl_seconds: None,
+                    video: None,
+                }
+                .into(),
+            )
+        }
+        tl::enums::MessageMedia::Document(d) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else { return None };
+            Some(
+                tl::types::InputMediaDocument {
+                    spoiler: false,
+                    id: tl::types::InputDocument { id: doc.id, access_hash: doc.access_hash, file_reference: doc.file_reference.clone() }.into(),
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                    query: None,
+                }
+                .into(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Файлы по группам альбомов: группы — в порядке первой встречи, по [`ALBUM_MAX`]; «только по одному» — каждый
+/// сам, после групп.
+fn groups(items: Vec<(Class, tl::enums::InputMedia)>) -> Vec<Vec<tl::enums::InputMedia>> {
+    let mut by: Vec<(Class, Vec<tl::enums::InputMedia>)> = Vec::new();
+    let mut alone = Vec::new();
+    for (c, m) in items {
+        if c == Class::Alone {
+            alone.push(vec![m]);
+            continue;
+        }
+        match by.iter_mut().find(|(x, _)| *x == c) {
+            Some((_, v)) => v.push(m),
+            None => by.push((c, vec![m])),
+        }
+    }
+    let mut out: Vec<Vec<tl::enums::InputMedia>> = Vec::new();
+    for (_, v) in by {
+        out.extend(v.chunks(ALBUM_MAX).map(<[tl::enums::InputMedia]>::to_vec));
+    }
+    out.extend(alone);
+    out
 }
 
 fn kind_of(mime: &str) -> AttachmentKind {
@@ -147,6 +342,12 @@ impl Inner {
         let Some(p) = Peer::parse(conv) else { return };
         let mut c = convert::conversation_of(p, cx);
         c.unread = Some(Counts::default());
+        if let Peer::User(id) = p
+            && let Some(u) = cx.users.get(&id)
+        {
+            self.kinds.borrow_mut().insert(conv.clone(), Kind { contact: u.contact, bot: u.bot, marked: false });
+        }
+        self.order.borrow_mut().push(conv.clone());
         self.convs.borrow_mut().insert(conv.clone(), c.clone());
         self.emit(ChannelEvent::Conversations(vec![c]));
     }
@@ -163,13 +364,299 @@ impl Inner {
         }
     }
 
-    /// Пачка обновлений → события ядра.
+    /// Беседы изменились (или папки сервера — `force`): папки заново, затем беседы и, если состав другой, папки.
+    fn publish(&self, mut changed: HashSet<ConversationId>, force: bool) {
+        let folders = if force || !changed.is_empty() { self.refolder(&mut changed) } else { None };
+        self.emit_convs(&changed);
+        if let Some(f) = folders {
+            self.emit(ChannelEvent::Folders(f));
+        }
+    }
+
+    /// Состав папок по правилам и состоянию бесед; у бесед — их папки (архив — как был). Папки другие — `Some`.
+    fn refolder(&self, changed: &mut HashSet<ConversationId>) -> Option<Vec<ChannelFolder>> {
+        let now = now_s().saturating_mul(1000);
+        let order = self.order.borrow();
+        let mut convs = self.convs.borrow_mut();
+        let kinds = self.kinds.borrow();
+        let known: Vec<Kindly> = order
+            .iter()
+            .filter_map(|id| convs.get(id))
+            .map(|c| {
+                let k = kinds.get(&c.id).copied().unwrap_or_default();
+                Kindly::of(c, k.contact, k.bot, k.marked, now)
+            })
+            .collect();
+        let mut folders = convert::folders(&self.filters.borrow(), &known, self.my_id);
+        let archived: Vec<ConversationId> = known.iter().filter(|k| k.archived).map(|k| k.id.clone()).collect();
+        if !archived.is_empty() {
+            folders.push(ChannelFolder { id: FolderRef::new(ARCHIVE), name: String::new(), parent: None, conversations: archived });
+        }
+        for id in order.iter() {
+            let Some(c) = convs.get_mut(id) else { continue };
+            let mut refs: Vec<FolderRef> = c.folders.iter().filter(|f| f.0 == ARCHIVE).cloned().collect();
+            refs.extend(folders.iter().filter(|f| f.id.0 != ARCHIVE && f.conversations.contains(id)).map(|f| f.id.clone()));
+            if refs != c.folders {
+                c.folders = refs;
+                changed.insert(id.clone());
+            }
+        }
+        let mut last = self.last_folders.borrow_mut();
+        (*last != folders).then(|| {
+            last.clone_from(&folders);
+            folders
+        })
+    }
+
+    /// Папка сервера изменилась (`updateDialogFilter`): нет — удалена.
+    fn filter_changed(&self, id: i32, filter: Option<tl::enums::DialogFilter>) {
+        let mut fs = self.filters.borrow_mut();
+        let pos = fs.iter().position(|f| filter_id(f) == Some(id));
+        match (pos, filter) {
+            (Some(i), Some(f)) => fs[i] = f,
+            (None, Some(f)) => fs.push(f),
+            (Some(i), None) => {
+                fs.remove(i);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Папки заново с сервера (`updateDialogFilters` без подробностей).
+    async fn reload_filters(&self) {
+        match call(&*self.wire, &tl::functions::messages::GetDialogFilters {}).await {
+            Ok(tl::enums::messages::DialogFilters::Filters(f)) => {
+                *self.filters.borrow_mut() = f.filters;
+                self.publish(HashSet::new(), true);
+            }
+            Err(e) => tracing::info!("telegram: folders not reloaded: {e}"),
+        }
+    }
+
+    /// Задача сеанса (прерывается вместе с ним).
+    fn later<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(Rc<Inner>) -> Fut,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let Some(me) = self.weak.upgrade() else { return };
+        let task = tokio::task::spawn_local(f(me));
+        let mut tasks = self.tasks.borrow_mut();
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    /// Опрос — запомнить сообщение: итоги приходят без него.
+    fn remember(&self, conv: &ConversationId, m: &Message) {
+        if let Some(p) = TgExtra::of(&m.extra).poll {
+            *self.polls.borrow_mut().entry(p.id, || (conv.clone(), m.clone())) = (conv.clone(), m.clone());
+        }
+    }
+
+    /// Части альбомов — одним сообщением (на месте первой встречи); прежний номер альбома, если он стал другим, —
+    /// вторым списком (ядру — удалить).
+    fn fold(&self, items: Vec<Raw>) -> (Vec<(ConversationId, Message)>, Stale) {
+        let mut out: Vec<(ConversationId, Message)> = Vec::new();
+        let mut slots: Vec<(AlbumKey, usize)> = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let mut al = self.albums.borrow_mut();
+            for (conv, m, g) in items {
+                let Some(g) = g else {
+                    out.push((conv, m));
+                    continue;
+                };
+                let key = (conv.clone(), g);
+                if let Some(id) = parse_msg(&m.id) {
+                    al.entry(key.clone(), Group::default).parts.insert(id, m.clone());
+                }
+                if !slots.iter().any(|(k, _)| *k == key) {
+                    slots.push((key, out.len()));
+                    out.push((conv, m));
+                }
+            }
+            for (key, i) in slots {
+                let Some(grp) = al.get_mut(&key) else { continue };
+                let parts: Vec<Message> = grp.parts.values().cloned().collect();
+                let Some(merged) = convert::merge_album(key.1, &parts) else { continue };
+                let head = parse_msg(&merged.id);
+                if let (Some(old), Some(new)) = (grp.head, head)
+                    && old != new
+                {
+                    stale.push((key.0.clone(), old));
+                }
+                grp.head = head;
+                out[i].1 = merged;
+            }
+        }
+        for (c, m) in &out {
+            self.remember(c, m);
+        }
+        (out, stale)
+    }
+
+    fn emit_stale(&self, stale: Stale) {
+        let mut by: Vec<(ConversationId, Vec<MessageId>)> = Vec::new();
+        for (c, id) in stale {
+            match by.iter_mut().find(|(x, _)| *x == c) {
+                Some((_, ids)) => ids.push(msg_id(id)),
+                None => by.push((c, vec![msg_id(id)])),
+            }
+        }
+        for (c, ids) in by {
+            self.emit(ChannelEvent::Deleted { conversation: Some(c), ids, for_all: true });
+        }
+    }
+
+    /// Сообщения (альбомы сведены) — по одному событию.
+    fn emit_fold(&self, items: Vec<Raw>, live: bool) {
+        if items.is_empty() {
+            return;
+        }
+        let (out, stale) = self.fold(items);
+        for (conv, m) in out {
+            self.emit(ChannelEvent::Messages { conversation: conv, messages: vec![m], live });
+        }
+        self.emit_stale(stale);
+    }
+
+    /// Правки: часть альбома, которого сеанс не видел, — альбом целиком с сервера (задачей).
+    fn emit_edits(&self, items: Vec<Raw>) {
+        let mut known = Vec::new();
+        for (conv, m, g) in items {
+            match g {
+                Some(g) if self.albums.borrow().get(&(conv.clone(), g)).is_none() => {
+                    if let Some(id) = parse_msg(&m.id) {
+                        self.refetch(conv, id, Some(g));
+                    }
+                }
+                _ => known.push((conv, m, g)),
+            }
+        }
+        self.emit_fold(known, false);
+    }
+
+    /// Сообщение (или альбом вокруг него) заново с сервера — событием.
+    fn refetch(&self, conv: ConversationId, id: i32, group: Option<i64>) {
+        self.later(move |me| async move {
+            let r = match group {
+                Some(g) => me.album_around(&conv, id, g).await,
+                None => me.by_ids(&conv, vec![id]).await,
+            };
+            match r {
+                Ok(items) => me.emit_fold(items, false),
+                Err(e) => tracing::debug!("telegram: message not refetched: {e}"),
+            }
+            me.check_secret();
+        });
+    }
+
+    /// Удалены сообщения: части известных альбомов — альбом заново без них (весь удалён — его номер); прочие — как
+    /// есть (ядро найдёт беседу по номеру).
+    fn deleted(&self, conv: Option<ConversationId>, ids: &[i32]) {
+        let mut plain = Vec::new();
+        let mut touched: Vec<AlbumKey> = Vec::new();
+        {
+            let mut al = self.albums.borrow_mut();
+            for &id in ids {
+                let key = al
+                    .iter()
+                    .find(|((c, _), g)| {
+                        g.parts.contains_key(&id)
+                            && match &conv {
+                                Some(x) => c == x,
+                                None => !Peer::parse(c).is_some_and(Peer::is_channel),
+                            }
+                    })
+                    .map(|(k, _)| k.clone());
+                match key {
+                    Some(k) => {
+                        if let Some(g) = al.get_mut(&k) {
+                            g.parts.remove(&id);
+                        }
+                        if !touched.contains(&k) {
+                            touched.push(k);
+                        }
+                    }
+                    None => plain.push(msg_id(id)),
+                }
+            }
+        }
+        if !plain.is_empty() {
+            self.emit(ChannelEvent::Deleted { conversation: conv, ids: plain, for_all: true });
+        }
+        for key in touched {
+            let (merged, old) = {
+                let mut al = self.albums.borrow_mut();
+                let Some(g) = al.get_mut(&key) else { continue };
+                let old = g.head;
+                let parts: Vec<Message> = g.parts.values().cloned().collect();
+                let merged = convert::merge_album(key.1, &parts);
+                g.head = merged.as_ref().and_then(|m| parse_msg(&m.id));
+                if merged.is_none() {
+                    al.remove(&key);
+                }
+                (merged, old)
+            };
+            let head = merged.as_ref().and_then(|m| parse_msg(&m.id));
+            if let Some(m) = merged {
+                self.emit(ChannelEvent::Messages { conversation: key.0.clone(), messages: vec![m], live: false });
+            }
+            if let Some(old) = old.filter(|o| Some(*o) != head) {
+                self.emit_stale(vec![(key.0, old)]);
+            }
+        }
+    }
+
+    /// Номер сообщения модели для номера Telegram: часть альбома — только первая; не из альбома — как есть.
+    fn head_of(&self, conv: &ConversationId, id: i32) -> Option<i32> {
+        let al = self.albums.borrow();
+        match al.iter().find(|((c, _), g)| c == conv && g.parts.contains_key(&id)) {
+            Some((_, g)) => g.head.filter(|h| *h == id),
+            None => Some(id),
+        }
+    }
+
+    /// Известный альбом с частью `id`: части по возрастанию и часть с подписью.
+    fn album_of(&self, conv: &ConversationId, id: i32) -> Option<(Vec<i32>, Option<i32>)> {
+        let al = self.albums.borrow();
+        let (_, g) = al.iter().find(|((c, _), g)| c == conv && g.parts.contains_key(&id))?;
+        let caption = g.parts.iter().find(|(_, m)| !m.body.plain().trim().is_empty()).map(|(k, _)| *k);
+        Some((g.parts.keys().copied().collect(), caption))
+    }
+
+    /// Итоги опроса (`updateMessagePoll`): известный — заново с новыми итогами; нет — сообщение с сервера.
+    fn poll_changed(&self, u: &tl::types::UpdateMessagePoll) {
+        let hit = self.polls.borrow().get(&u.poll_id).cloned();
+        match hit {
+            Some((conv, mut m)) => {
+                let mut more = TgExtra::of(&m.extra);
+                if let Some(p) = more.poll.as_mut() {
+                    extra::renew(p, u.poll.as_ref(), &u.results);
+                }
+                m.extra = more.to_extra();
+                self.remember(&conv, &m);
+                self.emit(ChannelEvent::Messages { conversation: conv, messages: vec![m], live: false });
+            }
+            None => {
+                if let (Some(peer), Some(id)) = (&u.peer, u.msg_id) {
+                    self.refetch(Peer::from_tl(peer).conv(), id, None);
+                }
+            }
+        }
+    }
+
+    /// Пачка обновлений → события ядра. Новые сообщения и правки копятся до первого другого обновления: части
+    /// альбома одной пачки уходят одним сообщением, порядок событий — как у сервера.
     fn on_batch(&self, b: UpdateBatch) {
         use tl::enums::Update as U;
         self.learn(&b.users, &b.chats);
         self.people(&b.users);
         let cx = Ctx::new(self.my_id, &b.users, &b.chats);
         let mut changed: HashSet<ConversationId> = HashSet::new();
+        let mut force = false;
+        let mut fresh: Vec<Raw> = Vec::new();
+        let mut edits: Vec<Raw> = Vec::new();
         let typing_on = |a: &tl::enums::SendMessageAction| !matches!(a, tl::enums::SendMessageAction::SendMessageCancelAction);
         for u in &b.updates {
             match u {
@@ -187,23 +674,25 @@ impl Inner {
                         }
                         changed.insert(conv.clone());
                     }
-                    self.emit(ChannelEvent::Messages { conversation: conv, messages: vec![m], live: true });
+                    fresh.push((conv, m, convert::grouped(message)));
+                    continue;
                 }
                 U::EditMessage(tl::types::UpdateEditMessage { message, .. })
                 | U::EditChannelMessage(tl::types::UpdateEditChannelMessage { message, .. }) => {
                     if let Some((conv, m)) = convert::message(message, &cx) {
                         self.ensure_conv(&conv, &cx);
-                        self.emit(ChannelEvent::Messages { conversation: conv, messages: vec![m], live: false });
+                        edits.push((conv, m, convert::grouped(message)));
                     }
+                    continue;
                 }
-                U::DeleteMessages(d) => {
-                    self.emit(ChannelEvent::Deleted { conversation: None, ids: d.messages.iter().map(|&i| msg_id(i)).collect(), for_all: true })
-                }
-                U::DeleteChannelMessages(d) => self.emit(ChannelEvent::Deleted {
-                    conversation: Some(Peer::Channel(d.channel_id).conv()),
-                    ids: d.messages.iter().map(|&i| msg_id(i)).collect(),
-                    for_all: true,
-                }),
+                U::MessageId(_) => continue,
+                _ => {}
+            }
+            self.emit_fold(std::mem::take(&mut fresh), true);
+            self.emit_edits(std::mem::take(&mut edits));
+            match u {
+                U::DeleteMessages(d) => self.deleted(None, &d.messages),
+                U::DeleteChannelMessages(d) => self.deleted(Some(Peer::Channel(d.channel_id).conv()), &d.messages),
                 U::ReadHistoryInbox(r) => self.read_me(Peer::from_tl(&r.peer).conv(), r.max_id, r.still_unread_count, &mut changed),
                 U::ReadChannelInbox(r) => self.read_me(Peer::Channel(r.channel_id).conv(), r.max_id, r.still_unread_count, &mut changed),
                 U::ReadHistoryOutbox(r) => {
@@ -229,11 +718,14 @@ impl Inner {
                     who: Peer::from_tl(&t.from_id).participant(),
                     on: typing_on(&t.action),
                 }),
-                U::MessageReactions(r) => self.emit(ChannelEvent::Reactions {
-                    conversation: Peer::from_tl(&r.peer).conv(),
-                    message: msg_id(r.msg_id),
-                    reactions: convert::reactions(&r.reactions),
-                }),
+                U::MessageReactions(r) => {
+                    // Реакции альбома — у первой части; у прочих частей в модели сообщения нет.
+                    let conv = Peer::from_tl(&r.peer).conv();
+                    if let Some(id) = self.head_of(&conv, r.msg_id) {
+                        self.emit(ChannelEvent::Reactions { conversation: conv, message: msg_id(id), reactions: convert::reactions(&r.reactions) });
+                    }
+                }
+                U::MessagePoll(p) => self.poll_changed(p),
                 U::DialogPinned(d) => {
                     if let tl::enums::DialogPeer::Peer(p) = &d.peer {
                         let conv = Peer::from_tl(&p.peer).conv();
@@ -252,11 +744,43 @@ impl Inner {
                         }
                     }
                 }
+                U::DialogUnreadMark(m) => {
+                    if let tl::enums::DialogPeer::Peer(p) = &m.peer {
+                        let conv = Peer::from_tl(&p.peer).conv();
+                        self.kinds.borrow_mut().entry(conv.clone()).or_default().marked = m.unread;
+                        changed.insert(conv);
+                    }
+                }
+                U::FolderPeers(f) => {
+                    for fp in &f.folder_peers {
+                        let tl::enums::FolderPeer::Peer(fp) = fp;
+                        let conv = Peer::from_tl(&fp.peer).conv();
+                        if let Some(c) = self.convs.borrow_mut().get_mut(&conv) {
+                            c.folders.retain(|x| x.0 != ARCHIVE);
+                            if fp.folder_id == 1 {
+                                c.folders.insert(0, FolderRef::new(ARCHIVE));
+                            }
+                            changed.insert(conv);
+                        }
+                    }
+                }
+                U::DialogFilter(f) => {
+                    self.filter_changed(f.id, f.filter.clone());
+                    force = true;
+                }
+                U::DialogFilterOrder(o) => {
+                    let pos = |f: &tl::enums::DialogFilter| filter_id(f).and_then(|id| o.order.iter().position(|x| *x == id)).unwrap_or(usize::MAX);
+                    self.filters.borrow_mut().sort_by_key(pos);
+                    force = true;
+                }
+                U::DialogFilters => self.later(|me| async move { me.reload_filters().await }),
                 U::ChannelTooLong(t) => self.emit(ChannelEvent::Gap { conversation: Some(Peer::Channel(t.channel_id).conv()) }),
                 _ => {}
             }
         }
-        self.emit_convs(&changed);
+        self.emit_fold(fresh, true);
+        self.emit_edits(edits);
+        self.publish(changed, force);
     }
 
     fn read_me(&self, conv: ConversationId, max_id: i32, still: i32, changed: &mut HashSet<ConversationId>) {
@@ -269,7 +793,71 @@ impl Inner {
             }
             changed.insert(conv.clone());
         }
+        if still == 0
+            && let Some(k) = self.kinds.borrow_mut().get_mut(&conv)
+        {
+            k.marked = false;
+        }
         self.emit(ChannelEvent::Read { conversation: conv, who: Reader::Me, up_to: msg_id(max_id) });
+    }
+
+    /// Сообщения беседы по номерам.
+    async fn by_ids(&self, conv: &ConversationId, ids: Vec<i32>) -> Result<Vec<Raw>, ChannelError> {
+        let (peer, _) = self.peer_of(conv)?;
+        let id: Vec<tl::enums::InputMessage> =
+            ids.into_iter().filter(|i| *i > 0).map(|id| tl::enums::InputMessage::Id(tl::types::InputMessageId { id })).collect();
+        if id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let res = match peer {
+            Peer::Channel(c) => {
+                let channel = self.book.input_channel(c).ok_or(ChannelError::NotFound)?;
+                call(&*self.wire, &tl::functions::channels::GetMessages { channel, id }).await?
+            }
+            _ => call(&*self.wire, &tl::functions::messages::GetMessages { id }).await?,
+        };
+        let (ms, users, chats, _) = messages_parts(res);
+        self.learn(&users, &chats);
+        self.people(&users);
+        let cx = Ctx::new(self.my_id, &users, &chats);
+        Ok(raw(&ms, &cx).into_iter().filter(|(c, ..)| c == conv).collect())
+    }
+
+    /// Альбом вокруг части `id`: его части идут подряд, не больше [`ALBUM_MAX`].
+    async fn album_around(&self, conv: &ConversationId, id: i32, group: i64) -> Result<Vec<Raw>, ChannelError> {
+        let span = i32::try_from(ALBUM_MAX).unwrap_or(10) - 1;
+        let ids = (id.saturating_sub(span).max(1)..=id.saturating_add(span)).collect();
+        Ok(self.by_ids(conv, ids).await?.into_iter().filter(|x| x.2 == Some(group)).collect())
+    }
+
+    /// Номера для удаления на сервере: у альбома — все его части.
+    async fn expand(&self, conv: &ConversationId, ids: &[i32]) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut unknown = Vec::new();
+        for &id in ids {
+            match self.album_of(conv, id) {
+                Some((parts, _)) => out.extend(parts),
+                None => unknown.push(id),
+            }
+        }
+        if !unknown.is_empty() {
+            match self.by_ids(conv, unknown.clone()).await {
+                Ok(found) => {
+                    for (_, m, g) in found {
+                        if let (Some(g), Some(id)) = (g, parse_msg(&m.id))
+                            && let Ok(all) = self.album_around(conv, id, g).await
+                        {
+                            out.extend(all.iter().filter_map(|(_, m, _)| parse_msg(&m.id)));
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("telegram: albums of deleted not checked: {e}"),
+            }
+            out.extend(unknown);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Ответ сервера с обновлениями (отправка, правка, реакция, пересылка) → события; номер сообщения по `random_id`.
@@ -409,39 +997,43 @@ impl Inner {
         };
         let cx = Ctx::new(self.my_id, &d.users, &d.chats);
         let now = now_s();
-        let mut convs: Vec<Conversation> = d.dialogs.iter().map(|x| convert::conversation(x, &cx, now)).collect();
-        let known: Vec<Kindly> = convs
-            .iter()
-            .map(|c| {
-                let user = Peer::parse(&c.id).and_then(|p| if let Peer::User(id) = p { cx.users.get(&id).copied() } else { None });
-                Kindly { id: c.id.clone(), kind: c.kind, contact: user.is_some_and(|u| u.contact), bot: user.is_some_and(|u| u.bot) }
-            })
-            .collect();
-        let mut folders = convert::folders(&filters, &known, self.my_id);
-        let archived: Vec<ConversationId> = convs.iter().filter(|c| c.folders.iter().any(|f| f.0 == ARCHIVE)).map(|c| c.id.clone()).collect();
-        if !archived.is_empty() {
-            folders.push(ChannelFolder { id: FolderRef::new(ARCHIVE), name: String::new(), parent: None, conversations: archived });
-        }
-        for c in &mut convs {
-            for f in &folders {
-                if f.id.0 != ARCHIVE && f.conversations.contains(&c.id) {
-                    c.folders.push(f.id.clone());
-                }
+        let convs: Vec<Conversation> = d.dialogs.iter().map(|x| convert::conversation(x, &cx, now)).collect();
+        {
+            let mut kinds = self.kinds.borrow_mut();
+            for x in &d.dialogs {
+                let user = match Peer::from_tl(&x.peer) {
+                    Peer::User(id) => cx.users.get(&id).copied(),
+                    _ => None,
+                };
+                let kind = Kind { contact: user.is_some_and(|u| u.contact), bot: user.is_some_and(|u| u.bot), marked: x.unread_mark };
+                kinds.insert(Peer::from_tl(&x.peer).conv(), kind);
             }
         }
+        *self.filters.borrow_mut() = filters;
         self.people(&d.users);
+        let order: Vec<ConversationId> = convs.iter().map(|c| c.id.clone()).collect();
         {
             let mut cache = self.convs.borrow_mut();
-            for c in &convs {
-                cache.insert(c.id.clone(), c.clone());
+            for c in convs {
+                cache.insert(c.id.clone(), c);
             }
+            let mut known = self.order.borrow_mut();
+            let extra: Vec<ConversationId> = known.iter().filter(|c| !order.contains(c) && cache.contains_key(*c)).cloned().collect();
+            *known = order.iter().cloned().chain(extra).collect();
         }
-        let order: Vec<ConversationId> = convs.iter().map(|c| c.id.clone()).collect();
+        // Папки — заново и событием в любом случае (ядро сверяет с прошлым догоном).
+        self.last_folders.borrow_mut().clear();
+        self.refolder(&mut HashSet::new());
+        let convs: Vec<Conversation> = {
+            let cache = self.convs.borrow();
+            order.iter().filter_map(|id| cache.get(id).cloned()).collect()
+        };
         self.emit(ChannelEvent::Conversations(convs));
+        let folders = self.last_folders.borrow().clone();
         self.emit(ChannelEvent::Folders(folders));
-        let mut tops: HashMap<ConversationId, Vec<Message>> = HashMap::new();
-        for (conv, m) in convert::messages(&d.messages, &cx) {
-            tops.entry(conv).or_default().push(m);
+        let mut tops: HashMap<ConversationId, Vec<Raw>> = HashMap::new();
+        for x in raw(&d.messages, &cx) {
+            tops.entry(x.0.clone()).or_default().push(x);
         }
         for (n, conv) in order.iter().enumerate() {
             if first && n < FIRST_HISTORY {
@@ -456,9 +1048,23 @@ impl Inner {
                     Err(e) => tracing::warn!("telegram: history not loaded: {e}"),
                 }
             }
-            if let Some(ms) = tops.remove(conv) {
-                self.emit(ChannelEvent::Messages { conversation: conv.clone(), messages: ms, live: false });
+            let Some(ms) = tops.remove(conv) else { continue };
+            // Последнее — часть альбома: в ответе диалогов только она; альбом целиком — из истории.
+            if ms.iter().any(|x| x.2.is_some()) {
+                match self.history(conv, None, u32::try_from(ALBUM_MAX * 2).unwrap_or(20)).await {
+                    Ok(page) if !page.messages.is_empty() => {
+                        let messages: Vec<Message> = page.messages.into_iter().take(1).map(|(_, m)| m).collect();
+                        self.emit(ChannelEvent::Messages { conversation: conv.clone(), messages, live: false });
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e @ (ChannelError::Network(_) | ChannelError::SignedOut(_))) => return Err(e),
+                    Err(e) => tracing::warn!("telegram: album not loaded: {e}"),
+                }
             }
+            let (out, stale) = self.fold(ms);
+            self.emit(ChannelEvent::Messages { conversation: conv.clone(), messages: out.into_iter().map(|(_, m)| m).collect(), live: false });
+            self.emit_stale(stale);
         }
         if let Some(s) = start {
             *self.state.borrow_mut() = Some(s.clone());
@@ -531,8 +1137,17 @@ impl Inner {
         self.learn(&users, &chats);
         self.people(&users);
         let cx = Ctx::new(self.my_id, &users, &chats);
-        let messages: Vec<(ConversationId, Message)> = convert::messages(&ms, &cx).into_iter().filter(|(c, _)| c == conv).collect();
-        let more = messages.len() >= limit as usize && limit > 0;
+        let mut items: Vec<Raw> = raw(&ms, &cx).into_iter().filter(|(c, ..)| c == conv).collect();
+        let more = items.len() >= limit as usize && limit > 0;
+        // Страница оборвала альбом (самое старое — его часть): альбом целиком — со следующей страницы.
+        if more
+            && let Some(g) = items.iter().min_by_key(|(_, m, _)| parse_msg(&m.id)).and_then(|x| x.2)
+            && items.iter().any(|x| x.2 != Some(g))
+        {
+            items.retain(|x| x.2 != Some(g));
+        }
+        let (messages, stale) = self.fold(items);
+        self.emit_stale(stale);
         Ok(Page { messages, more })
     }
 
@@ -583,8 +1198,27 @@ impl Inner {
         self.learn(&users, &chats);
         self.people(&users);
         let cx = Ctx::new(self.my_id, &users, &chats);
-        let messages = convert::messages(&ms, &cx);
-        let more = count.is_some_and(|n| usize::try_from(n).unwrap_or(0) > messages.len());
+        let mut items = raw(&ms, &cx);
+        let found = items.len();
+        // Нашлась часть альбома — альбом целиком (иначе ядро заменило бы его одной частью).
+        let mut seen: Vec<AlbumKey> = Vec::new();
+        let mut more_parts = Vec::new();
+        for (c, m, g) in &items {
+            let (Some(g), Some(id)) = (*g, parse_msg(&m.id)) else { continue };
+            let key = (c.clone(), g);
+            if seen.contains(&key) || self.albums.borrow().get(&key).is_some() {
+                continue;
+            }
+            seen.push(key);
+            match self.album_around(c, id, g).await {
+                Ok(parts) => more_parts.extend(parts),
+                Err(e) => tracing::debug!("telegram: album of a hit not loaded: {e}"),
+            }
+        }
+        items.extend(more_parts);
+        let (messages, stale) = self.fold(items);
+        self.emit_stale(stale);
+        let more = count.is_some_and(|n| usize::try_from(n).unwrap_or(0) > found);
         Ok(Page { messages, more })
     }
 
@@ -651,34 +1285,109 @@ impl Inner {
             };
             let updates = self.send_call(&req).await?;
             self.absorb(updates, Some(&sent)).ok_or_else(|| ChannelError::Protocol("sent, but no message id".into()))?
+        } else if let [only] = o.attachments.as_slice() {
+            let req = tl::functions::messages::SendMedia {
+                silent: o.silent,
+                background: false,
+                clear_draft: true,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: ip,
+                reply_to,
+                media: input_media(only)?,
+                message: text,
+                random_id,
+                reply_markup: None,
+                entities: ents,
+                schedule_date: schedule,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            };
+            let updates = self.send_call(&req).await?;
+            self.absorb(updates, Some(&sent)).ok_or_else(|| ChannelError::Protocol("sent, but no message id".into()))?
         } else {
+            // Несколько файлов — альбомами, как у официальных клиентов: сначала каждый на сервер
+            // (`messages.uploadMedia`), по ответу — группа, затем `sendMultiMedia` по 10. Подпись, ответ и
+            // черновик — у первого сообщения; `random_id` — `client_id` + номер файла.
+            let mut items = Vec::new();
+            for up in &o.attachments {
+                let req = tl::functions::messages::UploadMedia { business_connection_id: None, peer: ip.clone(), media: input_media(up)? };
+                let media = call(&*self.wire, &req).await?;
+                let r = media_ref(&media).ok_or_else(|| ChannelError::Protocol("uploaded media of unknown kind".into()))?;
+                items.push((class_of(&media), r));
+            }
             let mut first = None;
-            for (i, up) in o.attachments.iter().enumerate() {
-                let rid = random_id.wrapping_add(i as i64);
-                let req = tl::functions::messages::SendMedia {
-                    silent: o.silent,
-                    background: false,
-                    clear_draft: i == 0,
-                    noforwards: false,
-                    update_stickersets_order: false,
-                    invert_media: false,
-                    allow_paid_floodskip: false,
-                    peer: ip.clone(),
-                    reply_to: if i == 0 { reply_to.clone() } else { None },
-                    media: input_media(up)?,
-                    message: if i == 0 { text.clone() } else { String::new() },
-                    random_id: rid,
-                    reply_markup: None,
-                    entities: if i == 0 { ents.clone() } else { None },
-                    schedule_date: schedule,
-                    schedule_repeat_period: None,
-                    send_as: None,
-                    quick_reply_shortcut: None,
-                    effect: None,
-                    allow_paid_stars: None,
-                    suggested_post: None,
+            let mut next = random_id;
+            for (n, group) in groups(items).into_iter().enumerate() {
+                let lead = n == 0;
+                let rid = next;
+                next = next.wrapping_add(i64::try_from(group.len()).unwrap_or(1));
+                let caption = if lead { text.clone() } else { String::new() };
+                let caption_ents = if lead { ents.clone() } else { None };
+                let updates = if let [single] = group.as_slice() {
+                    let req = tl::functions::messages::SendMedia {
+                        silent: o.silent,
+                        background: false,
+                        clear_draft: lead,
+                        noforwards: false,
+                        update_stickersets_order: false,
+                        invert_media: false,
+                        allow_paid_floodskip: false,
+                        peer: ip.clone(),
+                        reply_to: if lead { reply_to.clone() } else { None },
+                        media: single.clone(),
+                        message: caption,
+                        random_id: rid,
+                        reply_markup: None,
+                        entities: caption_ents,
+                        schedule_date: schedule,
+                        schedule_repeat_period: None,
+                        send_as: None,
+                        quick_reply_shortcut: None,
+                        effect: None,
+                        allow_paid_stars: None,
+                        suggested_post: None,
+                    };
+                    self.send_call(&req).await?
+                } else {
+                    let multi_media = group
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, media)| {
+                            tl::types::InputSingleMedia {
+                                media,
+                                random_id: rid.wrapping_add(i64::try_from(k).unwrap_or(0)),
+                                message: if k == 0 { caption.clone() } else { String::new() },
+                                entities: if k == 0 { caption_ents.clone() } else { None },
+                            }
+                            .into()
+                        })
+                        .collect();
+                    let req = tl::functions::messages::SendMultiMedia {
+                        silent: o.silent,
+                        background: false,
+                        clear_draft: lead,
+                        noforwards: false,
+                        update_stickersets_order: false,
+                        invert_media: false,
+                        allow_paid_floodskip: false,
+                        peer: ip.clone(),
+                        reply_to: if lead { reply_to.clone() } else { None },
+                        multi_media,
+                        schedule_date: schedule,
+                        send_as: None,
+                        quick_reply_shortcut: None,
+                        effect: None,
+                        allow_paid_stars: None,
+                    };
+                    self.send_call(&req).await?
                 };
-                let updates = self.send_call(&req).await?;
                 let s = Sent { random_id: rid, ..sent.clone() };
                 let got = self.absorb(updates, Some(&s));
                 if first.is_none() {
@@ -711,7 +1420,9 @@ impl Inner {
             Action::Send(o) => self.send(o).await,
             Action::Edit { conversation, message, body, .. } => {
                 let (_, ip) = self.peer_of(&conversation)?;
-                let id = parse_msg(&message).ok_or(ChannelError::NotFound)?;
+                let head = parse_msg(&message).ok_or(ChannelError::NotFound)?;
+                // Подпись альбома — у своей части.
+                let id = self.album_of(&conversation, head).and_then(|(_, caption)| caption).unwrap_or(head);
                 let (text, entities) = text::from_ir(&body, &|id| self.user_for_mention(id));
                 let req = tl::functions::messages::EditMessage {
                     no_webpage: false,
@@ -737,6 +1448,8 @@ impl Inner {
                 if nums.is_empty() {
                     return Ok(Done::Ok);
                 }
+                // Альбом удаляется целиком — все его части.
+                let nums = self.expand(&conversation, &nums).await;
                 match peer {
                     Peer::Channel(id) => {
                         let channel = self.book.input_channel(id).ok_or(ChannelError::NotFound)?;
@@ -763,7 +1476,9 @@ impl Inner {
             }
             Action::MarkRead { conversation, up_to } => {
                 let (peer, ip) = self.peer_of(&conversation)?;
-                let max_id = parse_msg(&up_to).unwrap_or(0);
+                let up = parse_msg(&up_to).unwrap_or(0);
+                // Прочитано до альбома — до его последней части.
+                let max_id = self.album_of(&conversation, up).and_then(|(parts, _)| parts.last().copied()).unwrap_or(up).max(up);
                 match peer {
                     Peer::Channel(id) => {
                         let channel = self.book.input_channel(id).ok_or(ChannelError::NotFound)?;
@@ -775,7 +1490,7 @@ impl Inner {
                 }
                 let mut changed = HashSet::new();
                 self.read_me(conversation, max_id, 0, &mut changed);
-                self.emit_convs(&changed);
+                self.publish(changed, false);
                 Ok(Done::Ok)
             }
             Action::Typing { conversation, on } => {
@@ -880,7 +1595,7 @@ impl Inner {
             f(c);
             changed.insert(conv.clone());
         }
-        self.emit_convs(&changed);
+        self.publish(changed, false);
     }
 
     /// Название новой группы — имена первых участников.
@@ -1273,7 +1988,7 @@ impl TgSession {
         if let Some(n) = &u.username {
             shared.set_username(&Peer::User(u.id).conv(), n);
         }
-        let inner = Inner {
+        let inner = Rc::new_cyclic(|weak| Inner {
             wire,
             shared,
             account,
@@ -1288,8 +2003,15 @@ impl TgSession {
             feeding: Cell::new(false),
             authed_dcs: RefCell::new(HashSet::new()),
             tasks: RefCell::new(Vec::new()),
-        };
-        Ok(TgSession(Rc::new(inner)))
+            weak: weak.clone(),
+            albums: RefCell::new(Kept::default()),
+            polls: RefCell::new(Kept::default()),
+            filters: RefCell::new(Vec::new()),
+            kinds: RefCell::new(HashMap::new()),
+            order: RefCell::new(Vec::new()),
+            last_folders: RefCell::new(Vec::new()),
+        });
+        Ok(TgSession(inner))
     }
 }
 

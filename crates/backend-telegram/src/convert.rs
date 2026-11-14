@@ -1,5 +1,6 @@
 //! Ответы Telegram (TL) → общая модель (ADR 0012 п. 4): люди, беседы диалогов, сообщения с вложениями, реакции,
-//! папки. Чего в модели нет (опрос, геометка, контакт) — строкой в теле: знак и данные, без слов интерфейса.
+//! альбомы, папки. Чего в модели нет (геометка, контакт) — строкой в теле: знак и данные, без слов интерфейса; кнопки
+//! бота и опрос — структурой в `extra` ([`crate::extra`]), опрос ещё и строками тела.
 
 use std::collections::HashMap;
 
@@ -11,7 +12,8 @@ use postman_core::channel::{
 use postman_ir::{Align, Block, Inline};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{Peer, msg_id};
+use crate::extra::{self, TgExtra};
+use crate::ids::{Peer, msg_id, parse_msg};
 use crate::text;
 
 /// Откуда байты вложения (внутри `AttachmentSource`, JSON): по нему канал строит `InputFileLocation`; просроченный
@@ -360,37 +362,46 @@ fn doc_attachment(d: &tl::types::Document, conv: &ConversationId, msg: i32, voic
     }
 }
 
-/// Вложения и строка тела для того, чего в модели нет.
-fn media(m: &tl::enums::MessageMedia, conv: &ConversationId, msg: i32) -> (Vec<Attachment>, Option<String>) {
+/// Что дало медиа сообщения: вложения, строки тела для того, чего в модели нет, опрос.
+#[derive(Default)]
+struct Media {
+    attachments: Vec<Attachment>,
+    lines: Vec<String>,
+    poll: Option<extra::Poll>,
+}
+
+fn media(m: &tl::enums::MessageMedia, conv: &ConversationId, msg: i32) -> Media {
     use tl::enums::MessageMedia as M;
+    let line = |l: Option<String>| Media { lines: l.into_iter().collect(), ..Media::default() };
     match m {
         M::Photo(p) => match &p.photo {
-            Some(tl::enums::Photo::Photo(ph)) => (photo_attachment(ph, conv, msg).into_iter().collect(), None),
-            _ => (Vec::new(), None),
+            Some(tl::enums::Photo::Photo(ph)) => Media { attachments: photo_attachment(ph, conv, msg).into_iter().collect(), ..Media::default() },
+            _ => Media::default(),
         },
         M::Document(d) => match &d.document {
-            Some(tl::enums::Document::Document(doc)) => (vec![doc_attachment(doc, conv, msg, d.voice)], None),
-            _ => (Vec::new(), None),
+            Some(tl::enums::Document::Document(doc)) => Media { attachments: vec![doc_attachment(doc, conv, msg, d.voice)], ..Media::default() },
+            _ => Media::default(),
         },
         M::Contact(c) => {
             let name = [c.first_name.as_str(), c.last_name.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" ");
-            (Vec::new(), Some(format!("👤 {name} +{}", c.phone_number.trim_start_matches('+'))))
+            line(Some(format!("👤 {name} +{}", c.phone_number.trim_start_matches('+'))))
         }
-        M::Geo(g) => (Vec::new(), geo(&g.geo)),
-        M::GeoLive(g) => (Vec::new(), geo(&g.geo)),
-        M::Venue(v) => (Vec::new(), Some(format!("📍 {}, {}", v.title, v.address))),
+        M::Geo(g) => line(geo(&g.geo)),
+        M::GeoLive(g) => line(geo(&g.geo)),
+        M::Venue(v) => line(Some(format!("📍 {}, {}", v.title, v.address))),
+        // Опрос — структурой в `extra` (вид — CH-04), в теле — вопрос и варианты текстом (поиск, уведомления).
         M::Poll(p) => {
-            let tl::enums::Poll::Poll(poll) = &p.poll;
-            let tl::enums::TextWithEntities::Entities(q) = &poll.question;
-            (Vec::new(), Some(format!("📊 {}", q.text)))
+            let poll = extra::poll(&p.poll, &p.results);
+            let lines = std::iter::once(format!("📊 {}", poll.question)).chain(poll.answers.iter().map(|a| format!("◦ {}", a.text))).collect();
+            Media { lines, poll: Some(poll), ..Media::default() }
         }
-        M::Dice(d) => (Vec::new(), Some(d.emoticon.clone())),
+        M::Dice(d) => line(Some(d.emoticon.clone())),
         M::Game(g) => {
             let tl::enums::Game::Game(game) = &g.game;
-            (Vec::new(), Some(format!("🎮 {}", game.title)))
+            line(Some(format!("🎮 {}", game.title)))
         }
-        M::Invoice(i) => (Vec::new(), Some(format!("🧾 {}", i.title))),
-        _ => (Vec::new(), None),
+        M::Invoice(i) => line(Some(format!("🧾 {}", i.title))),
+        _ => Media::default(),
     }
 }
 
@@ -459,10 +470,11 @@ pub fn message(m: &tl::enums::Message, cx: &Ctx) -> Option<(ConversationId, Mess
             let author = author(x.from_id.as_ref(), peer, x.out, cx.me);
             let entities = x.entities.as_deref().unwrap_or_default();
             let mut doc = text::to_ir(&x.message, entities);
-            let (attachments, extra) = x.media.as_ref().map(|m| media(m, &conv, x.id)).unwrap_or_default();
-            if let Some(line) = extra {
+            let Media { attachments, lines, poll } = x.media.as_ref().map(|m| media(m, &conv, x.id)).unwrap_or_default();
+            for line in lines {
                 doc.blocks.push(Block::Paragraph { align: Align::Start, content: vec![Inline::text(line)] });
             }
+            let more = TgExtra { poll, keyboard: x.reply_markup.as_ref().and_then(extra::keyboard), ..TgExtra::default() };
             let mut mentions: Vec<ParticipantId> = entities
                 .iter()
                 .filter_map(|e| if let tl::enums::MessageEntity::MentionName(n) = e { Some(ParticipantId(n.user_id.to_string())) } else { None })
@@ -501,7 +513,7 @@ pub fn message(m: &tl::enums::Message, cx: &Ctx) -> Option<(ConversationId, Mess
                     reactions: x.reactions.as_ref().map(reactions).unwrap_or_default(),
                     mentions,
                     mine: x.out || peer == Peer::User(cx.me),
-                    extra: Default::default(),
+                    extra: more.to_extra(),
                 },
             ))
         }
@@ -548,12 +560,37 @@ pub fn messages(ms: &[tl::enums::Message], cx: &Ctx) -> Vec<(ConversationId, Mes
     ms.iter().filter_map(|m| message(m, cx)).collect()
 }
 
-/// Что известно о беседе для папок с правилами (контакты, группы, каналы, боты).
+/// Что известно о беседе для папок с правилами: тип (контакты, не контакты, группы, каналы, боты) и состояние
+/// («без заглушённых», «без прочитанного», «без архива»).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kindly {
     pub id: ConversationId,
     pub kind: ConversationKind,
     pub contact: bool,
     pub bot: bool,
+    pub muted: bool,
+    /// Есть непрочитанное или беседа отмечена непрочитанной (`unread_mark`).
+    pub unread: bool,
+    /// Есть непрочитанное упоминание меня.
+    pub mention: bool,
+    pub archived: bool,
+}
+
+impl Kindly {
+    /// По беседе модели: заглушено — на `now_ms`; `marked` — отметка «непрочитано» диалога.
+    pub fn of(c: &Conversation, contact: bool, bot: bool, marked: bool, now_ms: i64) -> Self {
+        let n = c.unread.unwrap_or_default();
+        Kindly {
+            id: c.id.clone(),
+            kind: c.kind,
+            contact,
+            bot,
+            muted: c.muted_until.is_some_and(|u| u > now_ms),
+            unread: n.unread > 0 || n.mentions > 0 || marked,
+            mention: n.mentions > 0,
+            archived: c.folders.iter().any(|f| f.0 == crate::ARCHIVE),
+        }
+    }
 }
 
 fn input_peer_conv(p: &tl::enums::InputPeer, me: i64) -> Option<ConversationId> {
@@ -566,53 +603,123 @@ fn input_peer_conv(p: &tl::enums::InputPeer, me: i64) -> Option<ConversationId> 
     })
 }
 
-/// Папки Telegram → папки учётки (ADR 0012, дерево — CH-04): явные беседы и беседы по правилам папки (контакты,
-/// не контакты, группы, каналы, боты) из известных; исключённые — убраны. Правила «без заглушённых», «без
-/// прочитанного», «без архива» меняются на лету — не учитываются.
+/// Правила папки Telegram.
+struct Rules {
+    contacts: bool,
+    non_contacts: bool,
+    groups: bool,
+    broadcasts: bool,
+    bots: bool,
+    exclude_muted: bool,
+    exclude_read: bool,
+    exclude_archived: bool,
+}
+
+impl Rules {
+    /// Беседа подходит по правилам — как у официального клиента: тип отмечен; без заглушённых — кроме заглушённых
+    /// с упоминанием меня вне архива; без прочитанного — только с непрочитанным или упоминанием; без архива.
+    fn fits(&self, k: &Kindly) -> bool {
+        let kind = match k.kind {
+            ConversationKind::Direct if k.bot => self.bots,
+            ConversationKind::Direct => (k.contact && self.contacts) || (!k.contact && self.non_contacts),
+            ConversationKind::Group => self.groups,
+            ConversationKind::Broadcast => self.broadcasts,
+            ConversationKind::MailThread => false,
+        };
+        kind && (!self.exclude_muted || !k.muted || (k.mention && !k.archived))
+            && (!self.exclude_read || k.unread || k.mention)
+            && (!self.exclude_archived || !k.archived)
+    }
+}
+
+/// Папки Telegram → папки учётки (ADR 0012, дерево — CH-04), состав — как у официального клиента: исключённые
+/// беседы — никогда; закреплённые и добавленные явно — всегда (первыми, закреплённые — в своём порядке); прочие
+/// известные — по правилам папки ([`Rules::fits`]). Правила «без заглушённых / прочитанного / архива» зависят от
+/// состояния бесед — канал пересчитывает папки, когда оно меняется.
 pub fn folders(filters: &[tl::enums::DialogFilter], known: &[Kindly], me: i64) -> Vec<ChannelFolder> {
     let mut out = Vec::new();
     for f in filters {
         let (id, title, include, pinned, exclude, rules) = match f {
             tl::enums::DialogFilter::Filter(f) => {
                 let tl::enums::TextWithEntities::Entities(t) = &f.title;
-                (
-                    f.id,
-                    t.text.clone(),
-                    &f.include_peers,
-                    &f.pinned_peers,
-                    Some(&f.exclude_peers),
-                    Some((f.contacts, f.non_contacts, f.groups, f.broadcasts, f.bots)),
-                )
+                let rules = Rules {
+                    contacts: f.contacts,
+                    non_contacts: f.non_contacts,
+                    groups: f.groups,
+                    broadcasts: f.broadcasts,
+                    bots: f.bots,
+                    exclude_muted: f.exclude_muted,
+                    exclude_read: f.exclude_read,
+                    exclude_archived: f.exclude_archived,
+                };
+                (f.id, t.text.clone(), &f.include_peers, &f.pinned_peers, &f.exclude_peers[..], Some(rules))
             }
             tl::enums::DialogFilter::Chatlist(f) => {
                 let tl::enums::TextWithEntities::Entities(t) = &f.title;
-                (f.id, t.text.clone(), &f.include_peers, &f.pinned_peers, None, None)
+                (f.id, t.text.clone(), &f.include_peers, &f.pinned_peers, &[][..], None)
             }
             tl::enums::DialogFilter::Default => continue,
         };
-        let mut convs: Vec<ConversationId> = pinned.iter().chain(include.iter()).filter_map(|p| input_peer_conv(p, me)).collect();
-        if let Some((contacts, non_contacts, groups, broadcasts, bots)) = rules {
+        let never: Vec<ConversationId> = exclude.iter().filter_map(|p| input_peer_conv(p, me)).collect();
+        let mut convs: Vec<ConversationId> = Vec::new();
+        for c in pinned.iter().chain(include.iter()).filter_map(|p| input_peer_conv(p, me)) {
+            if !never.contains(&c) && !convs.contains(&c) {
+                convs.push(c);
+            }
+        }
+        if let Some(rules) = rules {
             for k in known {
-                let fits = match k.kind {
-                    ConversationKind::Direct if k.bot => bots,
-                    ConversationKind::Direct => (k.contact && contacts) || (!k.contact && non_contacts),
-                    ConversationKind::Group => groups,
-                    ConversationKind::Broadcast => broadcasts,
-                    ConversationKind::MailThread => false,
-                };
-                if fits && !convs.contains(&k.id) {
+                if rules.fits(k) && !never.contains(&k.id) && !convs.contains(&k.id) {
                     convs.push(k.id.clone());
                 }
             }
         }
-        if let Some(ex) = exclude {
-            let ex: Vec<ConversationId> = ex.iter().filter_map(|p| input_peer_conv(p, me)).collect();
-            convs.retain(|c| !ex.contains(c));
-        }
-        convs.dedup();
         out.push(ChannelFolder { id: FolderRef(format!("f{id}")), name: title, parent: None, conversations: convs });
     }
     out
+}
+
+/// Номер альбома сообщения (`grouped_id`).
+pub fn grouped(m: &tl::enums::Message) -> Option<i64> {
+    match m {
+        tl::enums::Message::Message(x) => x.grouped_id,
+        _ => None,
+    }
+}
+
+/// Части альбома → одно сообщение модели (как у официальных клиентов — одним «пузырём»): номер, автор, время,
+/// ответ — первой части; вложения — всех по порядку; тело — подпись (первая непустая); правка — последняя;
+/// реакции — первой части (на неё же уходит своя реакция); упоминания — всех. В `extra` — номера частей.
+pub fn merge_album(group: i64, parts: &[Message]) -> Option<Message> {
+    let mut sorted: Vec<&Message> = parts.iter().collect();
+    sorted.sort_by_key(|m| parse_msg(&m.id).unwrap_or(i32::MAX));
+    sorted.dedup_by_key(|m| m.id.clone());
+    let head = *sorted.first()?;
+    let caption = sorted.iter().find(|m| !m.body.plain().trim().is_empty()).copied();
+    let mut out = head.clone();
+    out.attachments = sorted.iter().flat_map(|m| m.attachments.iter().cloned()).collect();
+    if let Some(c) = caption {
+        out.body = c.body.clone();
+    }
+    out.edited = sorted.iter().filter_map(|m| m.edited).max();
+    out.reply_to = sorted.iter().find_map(|m| m.reply_to.clone());
+    out.quotes = sorted.iter().find(|m| !m.quotes.is_empty()).map(|m| m.quotes.clone()).unwrap_or_default();
+    out.mentions = Vec::new();
+    for m in &sorted {
+        for p in &m.mentions {
+            if !out.mentions.contains(p) {
+                out.mentions.push(p.clone());
+            }
+        }
+    }
+    let mut more = TgExtra::of(&head.extra);
+    more.album = Some(extra::Album {
+        group,
+        parts: sorted.iter().filter_map(|m| parse_msg(&m.id)).collect(),
+        caption: caption.and_then(|c| parse_msg(&c.id)),
+    });
+    out.extra = more.to_extra();
+    Some(out)
 }
 
 /// Сообщение, которое сервер вернул на отправку коротким ответом (`updateShortSentMessage`): тело — отправленное.

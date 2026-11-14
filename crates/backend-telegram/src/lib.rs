@@ -21,6 +21,7 @@ use postman_core::channel::{
 };
 
 pub mod convert;
+pub mod extra;
 #[cfg(feature = "testkit")]
 pub mod fake;
 pub mod ids;

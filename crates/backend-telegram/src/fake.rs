@@ -2,8 +2,9 @@
 //! памяти разбирает запросы TL теми же типами слоя, что настоящий клиент, и отвечает байтами TL: личные беседы, группа,
 //! супергруппа, канал в архиве, папка; сообщения с сущностями, ответом с цитатой и файлом; вход телефоном, кодом и
 //! паролем (SRP), вход по QR; отправка (короткий ответ в личной беседе, полный — в группах и с файлом), правка,
-//! удаление, реакции, «прочитано», файлы кусками, просроченная ссылка на файл. События «от других» — сценарием
-//! ([`Script`]). Данные — вымышленные (`+999…`, `*_example`).
+//! удаление, реакции, «прочитано», файлы кусками, просроченная ссылка на файл; альбомы (`uploadMedia`,
+//! `sendMultiMedia`, `grouped_id`), кнопки бота, опрос, папки с правилами. События «от других» — сценарием
+//! ([`Script`]) и методами `*_by_other`. Данные — вымышленные (`+999…`, `*_example`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -33,6 +34,14 @@ pub const PHONE: &str = "+999 12 345-67-80";
 pub const CODE: &str = "24680";
 pub const PASSWORD: &str = "пароль проверки";
 pub const GROUP: i64 = 5001;
+/// Опрос в группе «Семья».
+pub const POLL: i64 = 880_001;
+/// Альбом из двух фото в «Команде».
+pub const TEAM_ALBUM: i64 = 990_001;
+/// Папки сервера: «Работа» — по правилу «контакты» и с «Командой»; «Непрочитанное» — все типы без заглушённых,
+/// прочитанного и архива, кроме бота.
+pub const WORK: i32 = 2;
+pub const UNREAD: i32 = 3;
 pub const TEAM: i64 = 7001;
 pub const NEWS: i64 = 7002;
 const HOME_DC: i32 = 2;
@@ -81,6 +90,18 @@ struct Msg {
     reply_to: Option<(i32, Option<String>)>,
     /// Реакции: ключ → кто.
     reactions: Vec<(String, Vec<i64>)>,
+    grouped: Option<i64>,
+    markup: Option<tl::enums::ReplyMarkup>,
+    /// Опрос: номер, вопрос, варианты (подпись, сколько голосов), мой голос.
+    poll: Option<FakePoll>,
+}
+
+#[derive(Clone)]
+struct FakePoll {
+    id: i64,
+    question: String,
+    answers: Vec<(String, i32)>,
+    mine: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -130,6 +151,8 @@ struct Server {
     qr_scanned: bool,
     pinned: HashSet<Peer>,
     muted: HashSet<Peer>,
+    filters: Vec<tl::enums::DialogFilter>,
+    next_group: i64,
 }
 
 /// Подставной сервер: `Dial` для канала и `Script` для проверок договора.
@@ -318,6 +341,139 @@ fn bold(offset: i32, length: i32) -> tl::enums::MessageEntity {
     tl::types::MessageEntityBold { offset, length }.into()
 }
 
+fn title(t: &str) -> tl::enums::TextWithEntities {
+    tl::types::TextWithEntities { text: t.into(), entities: Vec::new() }.into()
+}
+
+fn work_filter() -> tl::enums::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: true,
+        non_contacts: false,
+        groups: false,
+        broadcasts: false,
+        bots: false,
+        exclude_muted: false,
+        exclude_read: false,
+        exclude_archived: false,
+        title_noanimate: false,
+        id: WORK,
+        title: title("Работа"),
+        emoticon: None,
+        color: None,
+        pinned_peers: Vec::new(),
+        include_peers: vec![tl::types::InputPeerChannel { channel_id: TEAM, access_hash: TEAM * 10 }.into()],
+        exclude_peers: Vec::new(),
+    }
+    .into()
+}
+
+fn unread_filter() -> tl::enums::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: true,
+        non_contacts: true,
+        groups: true,
+        broadcasts: true,
+        bots: true,
+        exclude_muted: true,
+        exclude_read: true,
+        exclude_archived: true,
+        title_noanimate: false,
+        id: UNREAD,
+        title: title("Непрочитанное"),
+        emoticon: None,
+        color: None,
+        pinned_peers: Vec::new(),
+        include_peers: Vec::new(),
+        exclude_peers: vec![tl::types::InputPeerUser { user_id: BOT, access_hash: 0x3333 }.into()],
+    }
+    .into()
+}
+
+fn inline_keyboard() -> tl::enums::ReplyMarkup {
+    let button = |text: &str, t: tl::enums::InlineButtonType| -> tl::enums::KeyboardInlineButton {
+        tl::types::KeyboardInlineButton { style: None, text: text.into(), r#type: t }.into()
+    };
+    tl::types::ReplyInlineMarkup {
+        force_reply: false,
+        rows: vec![
+            tl::types::KeyboardInlineButtonRow {
+                buttons: vec![
+                    button("Да", tl::types::InlineButtonTypeCallback { requires_password: false, data: b"yes".to_vec() }.into()),
+                    button("Нет", tl::types::InlineButtonTypeCallback { requires_password: false, data: b"no".to_vec() }.into()),
+                ],
+            }
+            .into(),
+            tl::types::KeyboardInlineButtonRow {
+                buttons: vec![button("Справка", tl::types::InlineButtonTypeUrl { url: "https://example.test/help".into() }.into())],
+            }
+            .into(),
+        ],
+    }
+    .into()
+}
+
+impl FakePoll {
+    fn tl(&self) -> tl::enums::MessageMedia {
+        let option = |i: usize| vec![b'0' + u8::try_from(i).unwrap_or(0)];
+        let poll = tl::types::Poll {
+            id: self.id,
+            closed: false,
+            public_voters: false,
+            multiple_choice: false,
+            quiz: false,
+            open_answers: false,
+            revoting_disabled: false,
+            shuffle_answers: false,
+            hide_results_until_close: false,
+            creator: false,
+            subscribers_only: false,
+            question: title(&self.question),
+            answers: self
+                .answers
+                .iter()
+                .enumerate()
+                .map(|(i, (t, _))| tl::types::PollAnswer { text: title(t), option: option(i), media: None, added_by: None, date: None }.into())
+                .collect(),
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        };
+        tl::types::MessageMediaPoll { poll: poll.into(), results: self.results(), attached_media: None }.into()
+    }
+
+    fn results(&self) -> tl::enums::PollResults {
+        let option = |i: usize| vec![b'0' + u8::try_from(i).unwrap_or(0)];
+        tl::types::PollResults {
+            min: false,
+            has_unread_votes: false,
+            can_view_stats: false,
+            results: Some(
+                self.answers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, n))| {
+                        tl::types::PollAnswerVoters {
+                            chosen: self.mine == Some(i),
+                            correct: false,
+                            option: option(i),
+                            voters: Some(*n),
+                            recent_voters: Some(Vec::new()),
+                        }
+                        .into()
+                    })
+                    .collect(),
+            ),
+            total_voters: Some(self.answers.iter().map(|a| a.1).sum()),
+            recent_voters: None,
+            solution: None,
+            solution_entities: None,
+            solution_media: None,
+        }
+        .into()
+    }
+}
+
 impl FakeTelegram {
     pub fn new() -> Self {
         let mut s = Server {
@@ -340,6 +496,8 @@ impl FakeTelegram {
             qr_scanned: false,
             pinned: HashSet::new(),
             muted: HashSet::new(),
+            filters: vec![tl::enums::DialogFilter::Default, work_filter(), unread_filter()],
+            next_group: 990_100,
         };
         let anna = Peer::User(ANNA);
         let first = "Привет! Это первое сообщение";
@@ -354,6 +512,22 @@ impl FakeTelegram {
         let mention: tl::enums::MessageEntity = tl::types::MessageEntityMentionName { offset: 0, length: 4, user_id: ME }.into();
         let t1 = s.add(Peer::Channel(TEAM), Some(BORIS), "Иван, посмотри задачу", vec![mention], None, None);
         s.add(Peer::Channel(TEAM), Some(ANNA), "Уже смотрю", vec![], None, Some((t1, Some("посмотри задачу".into()))));
+        // Альбом: два фото, подпись — у первого.
+        for (i, caption) in ["Фото со встречи", ""].iter().enumerate() {
+            let f = s.file(&format!("meet{i}.jpg"), "image/jpeg", vec![0xd8; 300 + i], true);
+            let id = s.add(Peer::Channel(TEAM), Some(BORIS), caption, vec![], Some(f), None);
+            s.set(Peer::Channel(TEAM), id, |m| m.grouped = Some(TEAM_ALBUM));
+        }
+        // Бот с кнопками под сообщением.
+        let b = s.add(Peer::User(BOT), Some(BOT), "Выберите действие", vec![], None, None);
+        s.set(Peer::User(BOT), b, |m| m.markup = Some(inline_keyboard()));
+        // Опрос в группе: я голосовал за «Море».
+        let p = s.add(Peer::Chat(GROUP), Some(ANNA), "", vec![], None, None);
+        s.set(Peer::Chat(GROUP), p, |m| {
+            m.poll = Some(FakePoll {
+                id: POLL, question: "Куда поедем?".into(), answers: vec![("Лес".into(), 1), ("Море".into(), 2)], mine: Some(1)
+            })
+        });
         s.add(Peer::Channel(NEWS), None, "Новость дня", vec![], None, None);
         s.pinned.insert(Peer::Channel(TEAM));
         Self(Arc::new(Mutex::new(s)))
@@ -396,6 +570,90 @@ impl FakeTelegram {
     pub fn text(&self, peer: Peer, id: i32) -> Option<String> {
         self.lock().messages.iter().find(|m| m.peer == peer && m.id == id).map(|m| m.text.clone())
     }
+
+    /// Номер альбома сообщения на сервере; нет сообщения — `None` во внешнем.
+    pub fn grouped(&self, peer: Peer, id: i32) -> Option<Option<i64>> {
+        self.lock().messages.iter().find(|m| m.peer == peer && m.id == id).map(|m| m.grouped)
+    }
+
+    /// Номера сообщений беседы на сервере.
+    pub fn ids(&self, peer: Peer) -> Vec<i32> {
+        self.lock().messages.iter().filter(|m| m.peer == peer).map(|m| m.id).collect()
+    }
+
+    /// Собеседница шлёт альбом из `n` фото (подпись — у первого); части — пачками по `per_batch`.
+    pub fn anna_sends_album(&self, n: usize, caption: &str, per_batch: usize) -> Vec<i32> {
+        let mut s = self.lock();
+        s.next_group += 1;
+        let group = s.next_group;
+        let anna = Peer::User(ANNA);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let f = s.file(&format!("album{i}.jpg"), "image/jpeg", vec![0x42; 100 + i], true);
+            let id = s.add(anna, Some(ANNA), if i == 0 { caption } else { "" }, vec![], Some(f), None);
+            s.set(anna, id, |m| m.grouped = Some(group));
+            ids.push(id);
+        }
+        for chunk in ids.chunks(per_batch.max(1)) {
+            let mut ups = Vec::new();
+            for &id in chunk {
+                s.pts += 1;
+                let pts = s.pts;
+                let u: tl::enums::Update = tl::types::UpdateNewMessage { message: s.tl(id, anna), pts, pts_count: 1 }.into();
+                s.log.push((pts, u.clone()));
+                ups.push(u);
+            }
+            s.push(ups);
+        }
+        ids
+    }
+
+    /// Собеседник правит текст своего сообщения.
+    pub fn edit_by_other(&self, peer: Peer, id: i32, text: &str) {
+        let mut s = self.lock();
+        let date = s.tick();
+        s.set(peer, id, |m| {
+            m.text = text.into();
+            m.edit = Some(date);
+        });
+        let msg = s.tl(id, peer);
+        if peer.is_channel() {
+            s.push(vec![tl::types::UpdateEditChannelMessage { message: msg, pts: 1, pts_count: 1 }.into()]);
+        } else {
+            s.push_pts(|pts| tl::types::UpdateEditMessage { message: msg.clone(), pts, pts_count: 1 }.into());
+        }
+    }
+
+    /// Собеседник удаляет сообщения (не канал).
+    pub fn delete_by_other(&self, peer: Peer, ids: &[i32]) {
+        let mut s = self.lock();
+        s.messages.retain(|m| !(m.peer == peer && ids.contains(&m.id)));
+        let ids = ids.to_vec();
+        s.push_pts(|pts| tl::types::UpdateDeleteMessages { messages: ids.clone(), pts, pts_count: 1 }.into());
+    }
+
+    /// Кто-то проголосовал в опросе группы за вариант `option` — итоги всем.
+    pub fn vote_by_other(&self, option: usize) {
+        let mut s = self.lock();
+        let Some(m) = s.messages.iter_mut().find(|m| m.poll.is_some()) else { return };
+        let (peer, id) = (m.peer, m.id);
+        let Some(p) = m.poll.as_mut() else { return };
+        if let Some(a) = p.answers.get_mut(option) {
+            a.1 += 1;
+        }
+        let results = p.results();
+        let poll_id = p.id;
+        s.push(vec![
+            tl::types::UpdateMessagePoll { peer: Some(peer.to_tl()), msg_id: Some(id), top_msg_id: None, poll_id, poll: None, results }.into(),
+        ]);
+    }
+
+    /// Папку удалили на другом устройстве.
+    pub fn remove_filter(&self, id: i32) {
+        let mut s = self.lock();
+        s.filters.retain(|f| !matches!(f, tl::enums::DialogFilter::Filter(x) if x.id == id));
+        s.push(vec![tl::types::UpdateDialogFilter { id, filter: None }.into()]);
+    }
 }
 
 impl Server {
@@ -432,8 +690,28 @@ impl Server {
             }
         };
         let date = self.tick();
-        self.messages.push(Msg { id, peer, from, date, edit: None, text: text.into(), entities, file, reply_to, reactions: Vec::new() });
+        self.messages.push(Msg {
+            id,
+            peer,
+            from,
+            date,
+            edit: None,
+            text: text.into(),
+            entities,
+            file,
+            reply_to,
+            reactions: Vec::new(),
+            grouped: None,
+            markup: None,
+            poll: None,
+        });
         id
+    }
+
+    fn set(&mut self, peer: Peer, id: i32, f: impl FnOnce(&mut Msg)) {
+        if let Some(m) = self.messages.iter_mut().find(|m| m.peer == peer && m.id == id) {
+            f(m);
+        }
     }
 
     fn find(&self, peer: Peer, id: i32) -> Option<&Msg> {
@@ -457,6 +735,23 @@ impl Server {
                 tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(photo.into()), ttl_seconds: None, video: None }.into(),
             );
         }
+        let mut attributes: Vec<tl::enums::DocumentAttribute> = vec![tl::types::DocumentAttributeFilename { file_name: f.name.clone() }.into()];
+        if f.mime.starts_with("video/") {
+            attributes.push(
+                tl::types::DocumentAttributeVideo {
+                    round_message: false,
+                    supports_streaming: true,
+                    nosound: false,
+                    duration: 3.0,
+                    w: 320,
+                    h: 240,
+                    preload_prefix_size: None,
+                    video_start_ts: None,
+                    video_codec: None,
+                }
+                .into(),
+            );
+        }
         let doc = tl::types::Document {
             id: file,
             access_hash: f.hash,
@@ -467,7 +762,7 @@ impl Server {
             thumbs: None,
             video_thumbs: None,
             dc_id: HOME_DC,
-            attributes: vec![tl::types::DocumentAttributeFilename { file_name: f.name.clone() }.into()],
+            attributes,
         };
         Some(
             tl::types::MessageMediaDocument {
@@ -569,11 +864,13 @@ impl Server {
             reply_to,
             date: m.date,
             message: m.text.clone(),
-            media: m.file.and_then(|f| self.media(f)),
+            media: m.poll.as_ref().map(FakePoll::tl).or_else(|| m.file.and_then(|f| self.media(f))),
             entities: (!m.entities.is_empty()).then(|| m.entities.clone()),
             edit_date: m.edit,
             reactions: self.reactions(m),
             post: m.from.is_none(),
+            grouped_id: m.grouped,
+            reply_markup: m.markup.clone(),
             ..empty_message()
         }
         .into()
@@ -796,6 +1093,30 @@ impl Server {
         Ok(self.file(name, mime, bytes, photo))
     }
 
+    /// Файл медиа запроса: выгруженный — принять куски; уже на сервере (`uploadMedia`) — по номеру и ключу.
+    fn media_file(&mut self, media: &tl::enums::InputMedia) -> Result<i64, WireError> {
+        match media {
+            tl::enums::InputMedia::UploadedDocument(d) => {
+                let name = d
+                    .attributes
+                    .iter()
+                    .find_map(|a| if let tl::enums::DocumentAttribute::Filename(f) = a { Some(f.file_name.clone()) } else { None })
+                    .unwrap_or_default();
+                self.take_file(&d.file, &name, &d.mime_type, false)
+            }
+            tl::enums::InputMedia::UploadedPhoto(ph) => self.take_file(&ph.file, "photo.jpg", "image/jpeg", true),
+            tl::enums::InputMedia::Photo(p) => match &p.id {
+                tl::enums::InputPhoto::Photo(ip) if self.files.get(&ip.id).is_some_and(|f| f.photo && f.hash == ip.access_hash) => Ok(ip.id),
+                _ => Err(rpc(400, "MEDIA_INVALID")),
+            },
+            tl::enums::InputMedia::Document(d) => match &d.id {
+                tl::enums::InputDocument::Document(id) if self.files.get(&id.id).is_some_and(|f| !f.photo && f.hash == id.access_hash) => Ok(id.id),
+                _ => Err(rpc(400, "MEDIA_INVALID")),
+            },
+            _ => Err(rpc(400, "MEDIA_INVALID")),
+        }
+    }
+
     fn reply(r: &Option<tl::enums::InputReplyTo>) -> Option<(i32, Option<String>)> {
         match r {
             Some(tl::enums::InputReplyTo::Message(m)) => Some((m.reply_to_msg_id, m.quote_text.clone())),
@@ -909,27 +1230,7 @@ impl FakeWire {
             tl::types::auth::LoggedOut { future_auth_token: None }.into()
         });
         on!(f::messages::GetDialogs, |r| s.dialogs(r.folder_id == Some(1)));
-        on!(f::messages::GetDialogFilters, |_r| {
-            let filter = tl::types::DialogFilter {
-                contacts: true,
-                non_contacts: false,
-                groups: false,
-                broadcasts: false,
-                bots: false,
-                exclude_muted: false,
-                exclude_read: false,
-                exclude_archived: false,
-                title_noanimate: false,
-                id: 2,
-                title: tl::types::TextWithEntities { text: "Работа".into(), entities: Vec::new() }.into(),
-                emoticon: None,
-                color: None,
-                pinned_peers: Vec::new(),
-                include_peers: vec![tl::types::InputPeerChannel { channel_id: TEAM, access_hash: TEAM * 10 }.into()],
-                exclude_peers: Vec::new(),
-            };
-            tl::types::messages::DialogFilters { tags_enabled: false, filters: vec![tl::enums::DialogFilter::Default, filter.into()] }.into()
-        });
+        on!(f::messages::GetDialogFilters, |_r| tl::types::messages::DialogFilters { tags_enabled: false, filters: s.filters.clone() }.into());
         on!(f::messages::GetHistory, |r| {
             let p = Server::input_peer(&r.peer)?;
             s.history(p, r.offset_id, r.limit)
@@ -987,20 +1288,41 @@ impl FakeWire {
         });
         on!(f::messages::SendMedia, |r| {
             let p = Server::input_peer(&r.peer)?;
-            let file = match &r.media {
-                tl::enums::InputMedia::UploadedDocument(d) => {
-                    let name = d
-                        .attributes
-                        .iter()
-                        .find_map(|a| if let tl::enums::DocumentAttribute::Filename(f) = a { Some(f.file_name.clone()) } else { None })
-                        .unwrap_or_default();
-                    s.take_file(&d.file, &name, &d.mime_type, false)?
-                }
-                tl::enums::InputMedia::UploadedPhoto(ph) => s.take_file(&ph.file, "photo.jpg", "image/jpeg", true)?,
-                _ => return Err(rpc(400, "MEDIA_INVALID")),
-            };
+            let file = s.media_file(&r.media)?;
             let id = s.send(p, r.random_id, &r.message, r.entities.clone().unwrap_or_default(), Some(file), Server::reply(&r.reply_to))?;
             s.new_message_update(p, id, r.random_id)
+        });
+        on!(f::messages::UploadMedia, |r| {
+            Server::input_peer(&r.peer)?;
+            let file = s.media_file(&r.media)?;
+            s.media(file).ok_or_else(|| rpc(400, "MEDIA_INVALID"))?
+        });
+        on!(f::messages::SendMultiMedia, |r| {
+            let p = Server::input_peer(&r.peer)?;
+            if r.multi_media.len() < 2 || r.multi_media.len() > 10 {
+                return Err(rpc(400, "MULTI_MEDIA_TOO_LONG"));
+            }
+            let mut files = Vec::new();
+            for m in &r.multi_media {
+                let tl::enums::InputSingleMedia::Media(m) = m;
+                // Альбом — только из уже выгруженного (`uploadMedia`), как у Telegram.
+                if !matches!(m.media, tl::enums::InputMedia::Photo(_) | tl::enums::InputMedia::Document(_)) {
+                    return Err(rpc(400, "MEDIA_INVALID"));
+                }
+                files.push((s.media_file(&m.media)?, m));
+            }
+            s.next_group += 1;
+            let group = s.next_group;
+            let mut ups = Vec::new();
+            for (i, (file, m)) in files.into_iter().enumerate() {
+                let reply = if i == 0 { Server::reply(&r.reply_to) } else { None };
+                let id = s.send(p, m.random_id, &m.message, m.entities.clone().unwrap_or_default(), Some(file), reply)?;
+                s.set(p, id, |x| x.grouped = Some(group));
+                if let tl::enums::Updates::Updates(u) = s.new_message_update(p, id, m.random_id) {
+                    ups.extend(u.updates);
+                }
+            }
+            s.updates(ups)
         });
         on!(f::messages::EditMessage, |r| {
             let p = Server::input_peer(&r.peer)?;

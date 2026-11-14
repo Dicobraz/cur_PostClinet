@@ -171,3 +171,7 @@ cmd-account-export = Экспорт учётки…
 cmd-export-all = Экспорт всего…
 cmd-update-check = Проверить обновления
 cmd-update-install = Установить обновление
+cmd-chat-pin = Беседа канала: закрепить / открепить
+cmd-chat-mute = Беседа канала: заглушить / вернуть звук
+cmd-chat-mark-read = Беседа канала: прочитано
+cmd-chat-reply = Беседа канала: ответить

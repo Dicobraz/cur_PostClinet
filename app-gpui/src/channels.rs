@@ -1,5 +1,5 @@
-//! Каналы бесед в композиционном корне (ADR 0012, CH-02б): потоки учёток каналов и их события — без интерфейса
-//! каналов (он — CH-04). Учётки — из базы профиля (`chan_account`), канал — из реестра плагинов (`plugins.rs`);
+//! Каналы бесед в композиционном корне (ADR 0012, CH-02б): потоки учёток каналов и их события; интерфейс бесед —
+//! `chats.rs` (CH-04). Учётки — из базы профиля (`chan_account`), канал — из реестра плагинов (`plugins.rs`);
 //! демо-канал (`postman_demo::channel`) — только в `--demo`, без замера и снимков. Секреты сессий — хранилище ОС
 //! (`sys::credentials`, запись `Postman channel <канал> <учётка>`), HTML сообщений — в IR воркером-песочницей.
 //!
@@ -156,6 +156,7 @@ impl Mailer {
         let tx = postman_core::sync::spawn_channel(plugin, start, events, repaint);
         self.channels.lines.retain(|(a, _)| *a != account);
         self.channels.lines.push((account, tx));
+        self.chats_reload(cx);
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             // Поток учётки закончился — отправитель пробуждений закрыт, задача завершается.
@@ -181,7 +182,6 @@ impl Mailer {
     }
 
     /// Запрос интерфейса учётке канала (`Command::Channel`); `false` — не команда канала или потока нет.
-    #[allow(dead_code)] // интерфейс каналов — CH-04
     pub(crate) fn send_channel(&self, command: Command) -> bool {
         let Command::Channel { account, request } = command else { return false };
         self.channels.send(&account, *request)
@@ -234,8 +234,10 @@ impl Mailer {
         .detach();
     }
 
-    /// Ответ потока учётки канала. Интерфейса каналов ещё нет (CH-04): состояние — в память окна и журнал.
+    /// Ответ потока учётки канала: беседам на экране (`chats.rs`), состояние — в память окна и журнал.
     pub(crate) fn on_channel(&mut self, account: ChanAccount, update: Update, cx: &mut Context<Self>) {
+        // Беседы на экране (CH-04): дерево, список и открытая лента.
+        self.chat_update(&account, &update, cx);
         match update {
             Update::State(state) => {
                 if let ChannelState::Problem(e) = &state {
@@ -280,6 +282,8 @@ impl Mailer {
             })
             .collect();
         cx.set_global(crate::account_telegram::Lines(lines));
+        // Метка «нет связи» у раздела учётки в дереве.
+        self.folders.update(cx, |_, cx| cx.notify());
     }
 
     /// «Настройки → Аккаунты → Каналы бесед» (CH-03): вход удался, «Выйти», включатель.
@@ -296,6 +300,7 @@ impl Mailer {
                     self.channels.lines.retain(|(a, _)| a.channel.0 != TELEGRAM);
                     self.channels.states.retain(|(a, _)| a.channel.0 != TELEGRAM);
                     tracing::info!(channel = TELEGRAM, "channel: switched off");
+                    self.chats_reload(cx);
                 }
                 self.publish_channels(cx);
             }
@@ -350,6 +355,7 @@ impl Mailer {
                     self.channels.lines.retain(|(a, _)| a.channel.0 != MATRIX);
                     self.channels.states.retain(|(a, _)| a.channel.0 != MATRIX);
                     tracing::info!(channel = MATRIX, "channel: switched off");
+                    self.chats_reload(cx);
                 }
                 self.publish_channels(cx);
             }

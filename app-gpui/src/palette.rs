@@ -549,6 +549,11 @@ pub(crate) fn command_icon(id: &str) -> Option<char> {
         "mail.toggle_flag" => FLAG,
         "mail.pin" => crate::chrome::glyph::PIN,
         "mail.mute" => crate::chrome::glyph::MUTED,
+        // Беседа канала (CH-04).
+        "chat.pin" => crate::chrome::glyph::PIN,
+        "chat.mute" => crate::chrome::glyph::MUTED,
+        "chat.mark_read" => crate::chrome::glyph::READ,
+        "chat.reply" => crate::chrome::glyph::REPLY,
         "mail.categorize" => TAG,
         "mail.new" => NEW_MAIL,
         "mail.reply" => REPLY,

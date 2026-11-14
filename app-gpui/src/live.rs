@@ -1030,6 +1030,10 @@ impl Mailer {
 
     /// «Элементов: N» в строке состояния; папка загружена не вся — «N из M» (M — на сервере).
     pub(crate) fn items_status(&self, cx: &App) -> String {
+        // Беседы канала (CH-04): число бесед в списке.
+        if self.chat_active() {
+            return tr!("status-items", n = self.chats.list.read(cx).len());
+        }
         let list = self.list.read(cx);
         // Беседы в списке (S5-05б): писем, а не строк.
         let n = list.threads().map_or(list.count, |o| o.total());

@@ -44,6 +44,9 @@ pub(crate) struct Folders {
     pub(crate) offline: bool,
     /// Прокрутка дерева (T1-07): полоса и открытая папка в видимой области.
     scroll: ScrollHandle,
+    /// Беседы каналов (CH-04, `chat_tree.rs`): снимок для разделов учёток и то, что из них открыто в списке.
+    pub(crate) chats: std::sync::Arc<crate::chats::Snapshot>,
+    pub(crate) chat_scope: Option<crate::chats::Scope>,
     /// Новая папка или новое имя — полем в строке дерева (T1-04д).
     edit: Option<Edit>,
     /// Меню папки (ПКМ, T1-04д).
@@ -136,6 +139,8 @@ pub(crate) enum FolderEvent {
     Letters(crate::local::DraggedLetters, String),
     /// «Экспорт…» папки или группы «На этом компьютере» (S8-32).
     Export(String),
+    /// Строка учётки канала (CH-04): её беседы — в список.
+    Chat(crate::chats::Scope),
 }
 
 /// Что правится полем в дереве.
@@ -294,6 +299,8 @@ impl Folders {
             own: None,
             offline: false,
             scroll: ScrollHandle::new(),
+            chats: std::sync::Arc::default(),
+            chat_scope: None,
             edit: None,
             menu: None,
             _watch: None,
@@ -352,6 +359,12 @@ impl Folders {
         if let Some(last) = self.rows().len().checked_sub(1) {
             self.scroll.scroll_to_item(last);
         }
+    }
+
+    /// Сцены бесед каналов: дерево — у нижнего края, где разделы учёток каналов.
+    pub(crate) fn screen_scroll_chats(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_bottom();
+        cx.notify();
     }
 
     pub(crate) fn scrolled(&self) -> bool {
@@ -414,7 +427,7 @@ impl Folders {
 
     /// Строка «Избранного»: значок, имя, непрочитанные; щелчок — папка, правая кнопка — её меню.
     fn favorite_row(&self, m: &MailboxRow, l: &Look, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.results.is_none() && self.current.as_deref() == Some(&m.id);
+        let selected = self.results.is_none() && self.chat_scope.is_none() && self.current.as_deref() == Some(&m.id);
         let (id, menu) = (m.id.clone(), m.id.clone());
         let (ico, tint) = folder_icon(m.role.as_deref());
         let row_id = SharedString::from(format!("fav-{}", m.id));
@@ -708,12 +721,13 @@ impl Folders {
     /// Открытая папка — в свёрнутой группе `account` (`OWN` — своей): подпись группы показана выбранной.
     pub(crate) fn holds_current(&self, account: &str) -> bool {
         self.results.is_none()
+            && self.chat_scope.is_none()
             && self.collapsed.contains(account)
             && self.current.as_deref().is_some_and(|id| account_of(id).unwrap_or(OWN) == account)
     }
 
     fn folder(&self, m: &MailboxRow, indent: bool, node: Node, l: &Look, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.results.is_none() && self.current.as_deref() == Some(&m.id);
+        let selected = self.results.is_none() && self.chat_scope.is_none() && self.current.as_deref() == Some(&m.id);
         let id = m.id.clone();
         let fold = m.id.clone();
         let menu = m.id.clone();
@@ -920,7 +934,7 @@ impl Folders {
 }
 
 /// Шеврон группы: развёрнута — вниз, свёрнута — вправо.
-fn chevron(open: bool) -> Div {
+pub(crate) fn chevron(open: bool) -> Div {
     div().w(px(12.)).flex_none().child(chevron_glyph(open))
 }
 
@@ -931,7 +945,7 @@ fn chevron_glyph(open: bool) -> Div {
 }
 
 /// Полоса выделенной папки (T1-D): 3 × 16 px по центру строки у левого края.
-fn strip(color: Hsla) -> Div {
+pub(crate) fn strip(color: Hsla) -> Div {
     div().absolute().left_0().top(px(8.)).bottom(px(8.)).w(px(3.)).rounded_full().bg(color)
 }
 
@@ -951,7 +965,7 @@ pub(crate) fn ordered(accounts: &[AccountRow]) -> Vec<AccountRow> {
 }
 
 /// Высота строки папки: 32 px при обычной плотности (макет), на 4 px меньше — при компактной.
-fn row_h(l: &Look) -> f32 {
+pub(crate) fn row_h(l: &Look) -> f32 {
     l.m(Metric::HRow) + 8.
 }
 
@@ -1011,7 +1025,7 @@ pub(crate) fn folder_glyph(role: Option<&str>) -> char {
     }
 }
 
-fn unread(d: Stateful<Div>, n: u32, l: &Look) -> Stateful<Div> {
+pub(crate) fn unread(d: Stateful<Div>, n: u32, l: &Look) -> Stateful<Div> {
     d.child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(l.accent_text()).child(n.to_string()))
 }
 
@@ -1084,6 +1098,10 @@ impl Render for Folders {
         }
         if matches!(&edit, Some(EditKind::New { parent: None, .. })) {
             rows.extend(self.edit_row(0, false, &l));
+        }
+        // Учётки каналов бесед (CH-04) — разделами под почтовыми; пока показан поиск по почте, их нет.
+        if self.results.is_none() {
+            rows.extend(self.chat_rows(&l, cx));
         }
         let list =
             div().id("folders").flex().flex_col().gap(px(2.)).size_full().pr(px(10.)).overflow_y_scroll().track_scroll(&self.scroll).children(rows);

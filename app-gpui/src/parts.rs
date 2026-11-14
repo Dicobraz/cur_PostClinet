@@ -50,6 +50,8 @@ pub(crate) const PARTS: &[Part] = &[
     crate::drill_tasks::PART,
     crate::drill_stand::PART,
     crate::drill_net::PART,
+    // Беседы каналов (CH-04): сцены — последними, демо-канал запускает первая из них.
+    crate::chats::PART,
 ];
 
 /// Тексты всех частей (без `pets_ui::FTL`: его добавляет запуск).

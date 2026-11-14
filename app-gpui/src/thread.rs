@@ -349,16 +349,7 @@ impl ReadingPane {
         let mut shown = 0u64;
         for item in &ordered(&f.conv.items, newest_first(cx)) {
             match *item {
-                Item::Day(day) => {
-                    let label = if day == today {
-                        tr!("thread-today")
-                    } else if today.yesterday().is_ok_and(|y| y == day) {
-                        tr!("thread-yesterday")
-                    } else {
-                        day.strftime("%d.%m.%Y").to_string()
-                    };
-                    col = col.child(div().flex().justify_center().pt_1().text_color(l.text2()).child(label));
-                }
+                Item::Day(day) => col = col.child(crate::tape::day_row(crate::tape::day_label(day, today), &l)),
                 Item::Message(n) => {
                     let Some(m) = f.conv.messages.get(n) else { continue };
                     let who = if m.mine {
@@ -402,7 +393,7 @@ impl ReadingPane {
                     let row = m.row.clone();
                     // Вложения письма (макет): скрепка, имя, размер; щелчок — письмо целиком.
                     let atts = f.atts.get(&m.row.id).cloned().unwrap_or_default();
-                    let att_row = (!atts.is_empty()).then(|| att_chips(&atts, &l));
+                    let att_row = (!atts.is_empty()).then(|| crate::tape::att_chips(&atts, &l));
                     // «Ответить» / «Переслать» у последнего письма (макет).
                     let last = last_id.as_deref() == Some(m.row.id.as_str());
                     let respond = |key: &'static str, g: char, mode: Mode, row: EmailRow, cx: &mut Context<Self>| {
@@ -448,32 +439,13 @@ impl ReadingPane {
                         .children(att_row)
                         .children(actions);
                     // Аватар у чужих писем (макет): слева от письма.
-                    let face = (!m.mine).then(|| avatar(&who_name(m), 28., 11., &l).mt_1());
+                    let face = (!m.mine).then(|| crate::tape::avatar(&who_name(m), 28., 11., &l).mt_1());
                     col = col.child(div().flex().gap_2().items_start().w_full().when(m.mine, |d| d.justify_end()).children(face).child(card));
                 }
             }
         }
         Some(col.into_any_element())
     }
-}
-
-/// Вложения письма беседы (T2-26, макет): скрепка, имя, размер.
-fn att_chips(atts: &[(String, u64)], l: &crate::roles::Look) -> Div {
-    div().flex().flex_wrap().gap(px(6.)).pt_1().children(atts.iter().map(|(name, size)| {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .h(px(24.))
-            .px(px(8.))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(l.border())
-            .text_size(px(12.))
-            .child(icon(glyph::ATTACH, 12.).text_color(l.text2()))
-            .child(div().max_w(px(220.)).truncate().child(name.clone()))
-            .child(div().text_color(l.text2()).child(crate::attachments::size_text(*size)))
-    }))
 }
 
 /// «14 окт» (T2-26, макет `ThreadChat`).
@@ -504,22 +476,6 @@ fn snippet(doc: Option<&Document>) -> String {
             _ => None,
         })
         .unwrap_or_default()
-}
-
-/// Круг с инициалами (нейтральный цвет, как в шапке письма).
-fn avatar(name: &str, size: f32, text: f32, l: &crate::roles::Look) -> Div {
-    let c = l.cat(postman_core::palette::NEUTRAL);
-    div()
-        .size(px(size))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(c.bg)
-        .text_color(c.text)
-        .text_size(px(text))
-        .child(crate::list::initials(name))
 }
 
 impl ReadingPane {
@@ -651,7 +607,7 @@ impl ReadingPane {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover(|d| d.bg(l.hover()))
-                    .child(avatar(&who, 24., 10., &l))
+                    .child(crate::tape::avatar(&who, 24., 10., &l))
                     .child(div().w(px(128.)).flex_none().truncate().font_weight(FontWeight::SEMIBOLD).child(who))
                     .child(div().flex_1().min_w_0().truncate().text_color(l.text2()).child(text))
                     .when(m.row.has_attachment, |d| d.child(icon(glyph::ATTACH, 13.).text_color(l.text3())))
@@ -724,7 +680,7 @@ impl ReadingPane {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover(|d| d.bg(l.hover()))
-                    .child(avatar(who, 32., 12., &l))
+                    .child(crate::tape::avatar(who, 32., 12., &l))
                     .child(
                         div()
                             .flex_1()
@@ -801,7 +757,7 @@ impl ReadingPane {
         // Вложения раскрытого письма стопки (T2-26): у открытого — лента вложений, у остальных — их имена.
         let atts = open
             .is_none()
-            .then(|| self.feed.as_ref().and_then(|f| f.atts.get(&m.row.id)).filter(|a| !a.is_empty()).map(|a| att_chips(a, &l)))
+            .then(|| self.feed.as_ref().and_then(|f| f.atts.get(&m.row.id)).filter(|a| !a.is_empty()).map(|a| crate::tape::att_chips(a, &l)))
             .flatten();
         let invite = open.and_then(|r| r.invite.as_ref()).map(|c| crate::invite_card::render(c, self.me.as_deref(), cx));
         div()

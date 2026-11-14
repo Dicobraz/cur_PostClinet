@@ -253,6 +253,8 @@ impl Mailer {
         if query.is_empty() {
             return self.end_search(cx);
         }
+        // Поиск — по почте: беседы канала уступают место найденному (CH-04).
+        self.leave_chats(cx);
         let all = self.bar.read(cx).scope == crate::bar::Scope::All;
         let mailbox = self.search_mailbox(cx);
         let list = self.list.read(cx);
@@ -619,6 +621,10 @@ fn handlers(root: Div, cx: &mut Context<crate::Mailer>) -> Div {
         }
         // …затем просмотр вложения (S5-07).
         if this.section == crate::Section::Mail && this.reading.update(cx, |r, cx| r.close_preview(cx)) {
+            return;
+        }
+        // …затем ответ, правку и строки подтверждения в беседе канала (CH-04).
+        if this.section == crate::Section::Mail && this.chat_escape(cx) {
             return;
         }
         // …затем панель фильтров (S5-03) — назад к папкам.

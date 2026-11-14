@@ -90,6 +90,8 @@ pub(crate) struct Mailer {
     pub(crate) backend: Backend,
     /// Потоки учёток каналов бесед (ADR 0012, `channels.rs`).
     pub(crate) channels: crate::channels::Channels,
+    /// Беседы каналов на экране (CH-04, `chats.rs`): снимок, что открыто, список и лента.
+    pub(crate) chats: crate::chats::Chats,
     /// Живой ящик: статус синхронизации, строка входа, поиск на сервере (`live.rs`).
     pub(crate) live: crate::live::Live,
     /// Уведомления о новых письмах (T2-10).
@@ -223,6 +225,7 @@ impl Mailer {
         // «Ждём» в почте — ещё и письма моих невыполненных поручений (S6-11); дальше — `TasksAction::Waiting`.
         let waiting = tasks.read(cx).waiting_keywords();
         list.update(cx, |l, cx| l.set_waiting(waiting, cx));
+        let (chats, chat_subs) = crate::chats::Chats::new(cache.clone(), cx);
         let subscriptions = vec![
             cx.subscribe(&tasks, |this, _, action: &crate::tasks::TasksAction, cx| this.on_tasks(action, cx)),
             cx.subscribe_in(&contacts, window, |this, _, action: &crate::contacts::ContactsAction, window, cx| this.on_contacts(action, window, cx)),
@@ -282,6 +285,7 @@ impl Mailer {
                     }
                 }
                 FolderEvent::Toast(text) => this.toast(pets_ui::Level::Info, text.clone(), cx),
+                FolderEvent::Chat(scope) => this.open_chat_scope(scope.clone(), cx),
                 FolderEvent::Local(e) => this.local_folder_edit(e.clone(), cx),
                 FolderEvent::Letters(d, to) => this.letters_dropped(d, to.clone(), cx),
                 FolderEvent::Export(id) => {
@@ -401,6 +405,7 @@ impl Mailer {
         // Быстрый ответ ленты (`quick.rs`): @упоминания — по той же адресной книге, что у окон писем.
         reading.update(cx, |r, _| r.book = Some(compose.book.clone()));
         cx.set_global(crate::shared::People { book: compose.book.clone(), me: Some(postman_demo::ME.to_owned()) });
+        subscriptions.extend(chat_subs);
         Self {
             cache,
             focus,
@@ -422,6 +427,7 @@ impl Mailer {
             offline_ticking: false,
             backend: Backend::Demo,
             channels: Default::default(),
+            chats,
             live: Default::default(),
             newmail: Default::default(),
             rules_run: Default::default(),
@@ -543,6 +549,8 @@ impl Mailer {
     }
 
     pub(crate) fn open_mailbox(&mut self, id: String, cx: &mut Context<Self>) {
+        // Папка почты — вместо бесед канала (CH-04).
+        self.leave_chats(cx);
         self.drop_search(cx);
         // Общий ящик (S5-28): имена тех, кто взял письма в работу, — из адресной книги.
         if postman_cache::account_of(&id).is_some() {
@@ -993,8 +1001,11 @@ impl Mailer {
             body = body.child(self.splitter(Split::Folders, l, cx));
             let list_split = self.splitter(Split::List, l, cx);
             // Обновление хранилища (S8-16): строка вместо списка.
+            // Беседы канала (CH-04): их список и лента — на месте списка писем и письма.
+            let chat = self.chat_active();
             let list = || match self.store_upgrade(l) {
                 Some(e) => e,
+                None if chat => self.chats.list.clone().cached(full()).into_any_element(),
                 None => self.list.clone().cached(full()).into_any_element(),
             };
             // Ответ — в области чтения над письмом (S5-06б): своя кэшируемая view сверху карточки.
@@ -1002,6 +1013,7 @@ impl Mailer {
             let picked = self.list.read(cx).selection.len() > 1;
             let reading = || {
                 match self.compose.inline_view() {
+                    _ if chat => card(l).flex_1().child(self.chats.pane.clone().cached(full())),
                     _ if picked => card(l).flex_1().child(self.summary.clone().cached(full())),
                     Some(reply) => card(l)
                         .flex_1()
@@ -1028,7 +1040,8 @@ impl Mailer {
                         )
                         .child(reading()),
                 ),
-                Pane::Hidden if self.reading_instead_of_list(cx) => body.child(reading()),
+                Pane::Hidden if chat && self.chats.pane.read(cx).address().is_some() => body.child(reading()),
+                Pane::Hidden if !chat && self.reading_instead_of_list(cx) => body.child(reading()),
                 Pane::Hidden => body.child(card(l).flex_1().child(list())),
             };
         }

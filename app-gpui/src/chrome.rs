@@ -973,7 +973,10 @@ impl Mailer {
                 .rounded(l.px(Metric::RadiusControl))
                 .cursor_pointer()
                 .hover(|d| d.bg(l.hover()))
-                .child(icons::icon(b.ico, 16., b.tint.map_or(l.text(), |t| l.pm(t))))
+                .map(|d| match b.glyph {
+                    Some(g) => d.child(div().size(px(16.)).flex().items_center().justify_center().child(icon(g, 14.))),
+                    None => d.child(icons::icon(b.ico, 16., b.tint.map_or(l.text(), |t| l.pm(t)))),
+                })
                 .child(div().flex_1().child(tr!(b.id)))
                 .children(key.map(|k| div().pl(px(16.)).text_color(l.text2()).child(k)))
                 .on_click(cx.listener(move |this, _, window, cx| {

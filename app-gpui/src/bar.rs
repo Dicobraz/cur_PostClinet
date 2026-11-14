@@ -38,6 +38,8 @@ pub(crate) struct Button {
     pub(crate) label: &'static str,
     /// Значок Fluent и его токен (без токена — цветом текста, DESIGN «Значки»).
     pub(crate) ico: Ico,
+    /// Значок шрифтом ОС вместо набора Fluent (кнопки беседы канала: в наборе их значков нет).
+    pub(crate) glyph: Option<char>,
     pub(crate) tint: Option<Pm>,
     /// Команда реестра: есть ли она у сервера (S7-03), клавиша в подсказке и KeyTips (S5-18).
     pub(crate) cmd: &'static str,
@@ -47,7 +49,11 @@ pub(crate) struct Button {
 }
 
 const fn button(id: &'static str, label: &'static str, ico: Ico, tint: Option<Pm>, cmd: &'static str, run: MakeAction) -> Button {
-    Button { id, label, ico, tint, cmd, keyed: true, run: Run::Action(run) }
+    Button { id, label, ico, glyph: None, tint, cmd, keyed: true, run: Run::Action(run) }
+}
+
+const fn chat_button(id: &'static str, g: char, cmd: &'static str, run: MakeAction) -> Button {
+    Button { id, label: id, ico: icons::MAIL, glyph: Some(g), tint: None, cmd, keyed: false, run: Run::Action(run) }
 }
 
 /// Кнопки по макету: до разделителя — что сделать с письмом, после — ответ.
@@ -59,6 +65,7 @@ pub(crate) const BUTTONS: [Button; 9] = [
         id: "frame-category",
         label: "frame-category",
         ico: icons::TAG,
+        glyph: None,
         tint: Some(Pm::IconPink),
         cmd: "mail.categorize",
         keyed: false,
@@ -73,6 +80,18 @@ pub(crate) const BUTTONS: [Button; 9] = [
 
 /// Сколько первых кнопок — до разделителя.
 const FIRST_GROUP: usize = 6;
+
+/// Кнопки беседы канала (CH-04, DESIGN «Каналы»): без категорий и срока — «Нет у сервера — нет на экране». «Удалить»
+/// и «Архив» беседы макета ждут действий договора каналов (ADR 0012): их у канала нет.
+pub(crate) const CHAT_BUTTONS: [Button; 4] = [
+    chat_button("chat-bar-pin", glyph::PIN, "chat.pin", || Box::new(crate::chats::chat::Pin)),
+    chat_button("chat-bar-mute", glyph::MUTED, "chat.mute", || Box::new(crate::chats::chat::Mute)),
+    chat_button("chat-bar-read", glyph::READ, "chat.mark_read", || Box::new(crate::chats::chat::MarkRead)),
+    chat_button("chat-bar-reply", glyph::REPLY, "chat.reply", || Box::new(crate::chats::chat::Reply)),
+];
+
+/// Сколько первых кнопок беседы канала — до разделителя.
+const CHAT_FIRST_GROUP: usize = 3;
 
 /// Высота командной строки: кэшированное view не измеряется по содержимому, размер задаётся явно.
 pub(crate) const BAR_HEIGHT: f32 = 48.0;
@@ -134,6 +153,8 @@ pub(crate) struct CommandBar {
     pub(crate) take: Option<crate::shared::Act>,
     /// Идёт «Отправить и получить» (T3-02): кнопка недоступна, подсказка — «Отправка и получение…».
     pub(crate) syncing: bool,
+    /// В списке — беседы канала (CH-04): кнопки беседы вместо кнопок письма.
+    pub(crate) chat: bool,
     /// Ширина слева от строки в окне (macOS, макет `MainMac`: разделы над деревом папок) — для места под кнопки и
     /// положения меню «…». Иначе 0.
     pub(crate) lead: f32,
@@ -151,6 +172,7 @@ impl CommandBar {
             focused: false,
             take: None,
             syncing: false,
+            chat: false,
             lead: 0.,
         }
     }
@@ -197,7 +219,10 @@ impl CommandBar {
         let el = chrome::quiet_button(b.id, l)
             .flex_none()
             .when(icon_only, |d| d.px(px(7.)))
-            .child(icons::icon(b.ico, 20., b.tint.map_or(l.text(), |t| l.pm(t))))
+            .map(|d| match b.glyph {
+                Some(g) => d.child(div().size(px(20.)).flex().items_center().justify_center().child(chrome::icon(g, 16.))),
+                None => d.child(icons::icon(b.ico, 20., b.tint.map_or(l.text(), |t| l.pm(t)))),
+            })
             .when(!icon_only, |d| d.child(tr!(b.label)))
             .on_click(cx.listener(move |_, _, window, cx| match b.run {
                 Run::Action(action) => window.dispatch_action(action(), cx),
@@ -259,7 +284,7 @@ impl Render for CommandBar {
         // письма — «Вернуть в очередь». Как в макете: у письма коллеги — тоже «Взять в работу» (в шапке письма —
         // «Забрать себе»).
         let take_label = self.take.map(|t| if t == crate::shared::Act::Release { t.label() } else { crate::shared::Act::Take.label() });
-        let take = self.take.zip(take_label.clone()).map(|(t, label)| {
+        let take = self.take.filter(|_| !self.chat).zip(take_label.clone()).map(|(t, label)| {
             let hint = tr!(if t == crate::shared::Act::Release { "shared-release-hint" } else { "shared-take-hint" });
             let b = crate::buttons::secondary("bar-take", &l)
                 .mr(px(8.))
@@ -270,17 +295,18 @@ impl Render for CommandBar {
         });
         // «Нет у сервера — нет на экране» (S7-03).
         let features = crate::features::get(cx);
-        let shown: Vec<(usize, Button)> = BUTTONS.iter().copied().enumerate().filter(|(_, b)| crate::features::available(b.cmd, features)).collect();
-        let first = shown.iter().filter(|(i, _)| *i < FIRST_GROUP).count();
+        let (buttons, first_group): (&[Button], usize) = if self.chat { (&CHAT_BUTTONS, CHAT_FIRST_GROUP) } else { (&BUTTONS, FIRST_GROUP) };
+        let shown: Vec<(usize, Button)> = buttons.iter().copied().enumerate().filter(|(_, b)| crate::features::available(b.cmd, features)).collect();
+        let first = shown.iter().filter(|(i, _)| *i < first_group).count();
         // Во время поиска — шире, охват внутри поля. Клавиша поиска — плашкой KeyTips, не в поле.
         let active = self.focused || !self.search.read(cx).value().trim().is_empty();
         let search_w = if active { SEARCH_W_ACTIVE } else { SEARCH_W };
         // Сколько кнопок влезает: окно минус поля, «Новое письмо», «Взять в работу», «Отправить и получить», поиск и «Вид».
         let new_w = 14. + 20. + 8. + text_w(&tr!("frame-new"), window) + 14. + 12. + GAP;
-        let take_w = take_label.as_deref().map_or(0., |t| 12. + 20. + 6. + text_w(t, window) + 12. + 8. + GAP);
+        let take_w = take_label.as_deref().filter(|_| !self.chat).map_or(0., |t| 12. + 20. + 6. + text_w(t, window) + 12. + 8. + GAP);
         let fixed = 12. + new_w + take_w + SYNC_W + GAP + 12. + search_w + GAP + VIEW_W + 12.;
         let room = window.viewport_size().width / px(1.) - self.lead - fixed;
-        let icon_only = |i: usize| ANSWERS_ICON_ONLY && i >= FIRST_GROUP;
+        let icon_only = |i: usize| ANSWERS_ICON_ONLY && i >= first_group;
         let widths: Vec<f32> =
             shown.iter().map(|(i, b)| if icon_only(*i) { ICON_ONLY_W } else { BUTTON_PAD + text_w(&tr!(b.label), window) }).collect();
         let fit = fitting(&widths, first, room);

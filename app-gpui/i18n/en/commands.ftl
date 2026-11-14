@@ -171,3 +171,7 @@ cmd-account-export = Export account…
 cmd-export-all = Export everything…
 cmd-update-check = Check for updates
 cmd-update-install = Install update
+cmd-chat-pin = Channel conversation: pin / unpin
+cmd-chat-mute = Channel conversation: mute / unmute
+cmd-chat-mark-read = Channel conversation: mark as read
+cmd-chat-reply = Channel conversation: reply

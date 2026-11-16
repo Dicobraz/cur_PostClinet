@@ -13,7 +13,7 @@ postman-cache = { workspace = true, features = ["store6"] }
 jiff.workspace = true
 postman-calendar.workspace = true
 # Большая картинка в тексте письма (S5-07б) — собирается при первом запросе, а не лежит в репозитории.
-png = "0.17"
+png = "0.18"
 
 [dev-dependencies]
 # Сборка и проверка подписанных образцов (S5-12, `tests/smime_samples.rs`).

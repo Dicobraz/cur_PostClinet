@@ -68,7 +68,7 @@ pets-update = { git = "https://github.com/Dicobraz421/pets", rev = "bd68b87dd896
 futures = "0.3"
 tracing = "0.1"
 # Снимки экранов (`--screens`, S2-05): запись PNG.
-png = "0.17"
+png = "0.18"
 # Картинки `cid:` (S3-03): воркер отдаёт готовые пиксели RGBA, здесь — только кадр для gpui, без декодеров.
 image = { version = "0.25", default-features = false }
 

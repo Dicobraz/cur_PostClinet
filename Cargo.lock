@@ -7650,7 +7650,7 @@ name = "postman-demo"
 version = "0.1.0-beta.7"
 dependencies = [
  "jiff",
- "png 0.17.16",
+ "png 0.18.1",
  "postman-cache",
  "postman-calendar",
  "postman-core",
@@ -7716,7 +7716,7 @@ dependencies = [
  "pets-shell",
  "pets-ui",
  "pets-update",
- "png 0.17.16",
+ "png 0.18.1",
  "postman-backend-dav",
  "postman-backend-ews",
  "postman-backend-imap",

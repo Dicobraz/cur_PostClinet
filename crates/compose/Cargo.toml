@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 postman-ir.workspace = true
 postman-smime.workspace = true
-mail-builder = "1"
+mail-builder = "2"
 pulldown-cmark = { version = "0.13", default-features = false }
 
 [dev-dependencies]
